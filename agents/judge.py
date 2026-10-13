@@ -13,6 +13,7 @@ LLM: config.MODEL_JUDGE - 항목별 점수(1~5)와 근거·출처, 법률 리스
 import hashlib
 import json
 import logging
+import re
 import statistics
 from datetime import datetime
 from pathlib import Path
@@ -99,7 +100,8 @@ PROMPT = """너는 AI 반도체 VC의 투자 심사역이다. '{name}'을 아래
 2. 기준표의 한 칸 조건을 모두 충족해야 그 점수를 준다. 두 칸 사이면 낮은 점수를 준다.
 3. 근거로 쓴 출처 번호를 source_ids에 넣는다. 출처 목록에 없는 번호는 쓰지 마라.
 4. 공개 정보로 항목을 확인할 수 없으면 insufficient=true로 두고, 근거에 '정보 부족'이라고 쓴다.
-5. market은 대상 세부 분야 수치(segment_specific=true)만 3~5점 근거로 인정한다.
+5. market은 대상 세부 분야 전체 수치(segment_specific=true이고 sub_market=false)만 3~5점 근거로 인정한다.
+   sub_market=true(PC·스마트폰 등 하위 시장) 수치는 3~5점 근거로 쓰지 않는다. 같은 범위의 성장률이 출처마다 다르면 낮은 값으로 채점한다.
 6. traction은 기술 요약(tech_summary)의 공개 매출·계약만 근거로 쓴다. 투자 라운드·투자사 정보는 traction 근거로 쓰지 않는다.
 7. 법률 리스크(legal_risk): 핵심 기술 관련 소송·분쟁이 자료에 있으면 사업 지속에 영향을 주는지 자료로 판단하고, 판단 근거를 evidence에 쓴다.
    소송이 있어도 사업 영향이 없다거나 이미 해소됐다는 출처가 있으면 그 근거를 쓰고 unresolved=false다.
@@ -146,6 +148,27 @@ def is_placeholder(analysis: dict | None) -> bool:
     return not analysis or bool(analysis.get("todo") or analysis.get("failed"))
 
 
+GROWTH_PATTERN = re.compile(r"(\d+(?:\.\d+)?)\s*%")
+
+
+def market_growth_cap(market: dict | None) -> tuple[int | None, str]:
+    """세부 분야 전체(하위 시장 제외) 성장률 중 가장 낮은 값으로 채점 기준표의 시장성 상한을 정한다.
+    기준표: 성장률 10% 미만 2점, 10~20% 3점, 20% 이상 4~5점. 성장률 수치가 없으면 (None, "")
+    (같은 범위의 성장률이 출처마다 다르면 낮은 값으로 채점한다. 높은 값을 고르면 근거보다 높게 채점된다)
+    """
+    rates = []
+    for f in (market or {}).get("figures") or []:
+        if f.get("kind") == "성장률" and f.get("segment_specific") and not f.get("sub_market"):
+            m = GROWTH_PATTERN.search(str(f.get("value", "")))
+            if m:
+                rates.append(float(m.group(1)))
+    if not rates:
+        return None, ""
+    low = min(rates)
+    cap = 2 if low < 10 else 3 if low < 20 else 5
+    return cap, f"세부 분야 전체 성장률 최저 {low:g}%"
+
+
 def apply_evidence_rules(card: Scorecard, state: dict, sources: list[dict]) -> dict:
     """설계 3.5 근거 규칙을 코드로 적용한다.
     정보 부족이거나 유효한 출처가 없는 항목은 최대 2점으로 제한한다 (근거 없이 높은 점수 방지).
@@ -172,6 +195,11 @@ def apply_evidence_rules(card: Scorecard, state: dict, sources: list[dict]) -> d
         evidence = s.evidence
         if insufficient and "정보 부족" not in evidence:
             evidence = f"정보 부족: {evidence}"
+        if key == "market":
+            cap, basis = market_growth_cap(state.get("market_analysis"))
+            if cap is not None and score > cap:
+                score = cap
+                evidence = f"{evidence} (기준표 상한: {basis} → 최대 {cap}점)"
         items[key] = {"score": score, "evidence": evidence, "sources": cited, "insufficient": insufficient}
     return items
 

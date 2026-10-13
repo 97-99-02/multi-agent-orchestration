@@ -304,3 +304,28 @@ def test_traction_capped_without_public_revenue_or_contracts():
     with_contract = {**STATE, "tech_summary": {"public_revenue_contracts": ["2025년 공급 계약"]}}
     items, _, _ = evaluate(card(traction=item(3)), with_contract)
     assert items["traction"]["score"] == 3
+
+
+# ---------- 시장성: 세부 분야 전체 수치, 낮은 값으로 상한 ----------
+def figure(value, sub=False, specific=True, kind="성장률"):
+    return {"kind": kind, "value": value, "segment_specific": specific, "sub_market": sub}
+
+
+def test_market_cap_uses_lowest_segment_wide_growth_and_ignores_sub_market():
+    market = {"figures": [figure("16%"), figure("25%"), figure("62.8%", sub=True), figure("40%", specific=False)]}
+    assert judge.market_growth_cap(market) == (3, "세부 분야 전체 성장률 최저 16%")
+    assert judge.market_growth_cap({"figures": [figure("62.8%", sub=True)]}) == (None, "")
+    assert judge.market_growth_cap({"figures": [figure("8%")]})[0] == 2
+    assert judge.market_growth_cap({"figures": [figure("22.5%")]})[0] == 5
+
+
+def test_market_score_capped_by_rubric():
+    state = {**STATE, "market_analysis": {"figures": [figure("16%"), figure("62.8%", sub=True)]}}
+    items, total, _ = evaluate(card(market=item(5)), state)
+    assert items["market"]["score"] == 3
+    assert "최저 16% → 최대 3점" in items["market"]["evidence"]
+    assert total == evaluate(card(market=item(3)), state)[1]
+
+
+def test_judge_prompt_excludes_sub_market_figures():
+    assert "sub_market=true(PC·스마트폰 등 하위 시장) 수치는 3~5점 근거로 쓰지 않는다" in judge.PROMPT
