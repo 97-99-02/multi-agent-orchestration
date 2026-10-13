@@ -57,6 +57,7 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
 반드시 아래 규칙을 지키세요.
 1. 제공된 [분석 자료]에 있는 내용과 숫자만 사용합니다. 자료에 없는 숫자·사실은 절대 만들지 않습니다.
 2. 숫자는 자료에 적힌 표기 그대로 옮깁니다. (반올림·단위 변환·추정 금지)
+   '수십억 달러', '수천억 원' 같은 어림 표현을 쓰지 말고 자료의 수치를 그대로 씁니다.
 3. 자료에 정보가 없으면 '정보 부족'이라고 씁니다.
 4. 출력은 마크다운이며, 아래 [목차]의 순서와 제목('## ' 형식)을 그대로 따릅니다.
 5. 맨 앞은 'SUMMARY'입니다. 900자 이내이며, 투자 추천 보고서는 반드시 아래 틀을 그대로 지킵니다.
@@ -100,9 +101,10 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
     '이해관계자' 장은 창업자·핵심 인력(team_analysis)과 투자사·투자 조건(company의 investors, 투자 금액·기업가치)을,
     '도메인 적용' 장은 고객·PoC·공급 계약 등 실적(tech_summary의 public_revenue_contracts)과 적용 분야(세부 분야)를 다룹니다.
     자료가 없으면 그 장에 '정보 부족'이라고 명시하고 없는 내용을 채우지 않습니다.
-18. '사업 리스크' 장의 리스크마다 근거 출처 번호를 붙입니다. (market_risks, competitive_risks, 기술 약점 등 자료에 있는 리스크)
+18. '최적화된 성능', '혁신적인', '획기적인', '탁월한' 같은 회사 홍보 표현을 옮기지 말고, 수치·사실로만 서술합니다.
+19. '사업 리스크' 장의 리스크마다 근거 출처 번호를 붙입니다. (market_risks, competitive_risks, 기술 약점 등 자료에 있는 리스크)
     유리한 근거만 고르지 말고, 자료에 있는 약점·리스크·반대 근거도 해당 장에 씁니다.
-19. [분석 자료]에 halted가 있으면 평가가 중간에 멈춘 것이므로 '한계점' 장 첫 문장에 그 사유를 그대로 씁니다.
+20. [분석 자료]에 halted가 있으면 평가가 중간에 멈춘 것이므로 '한계점' 장 첫 문장에 그 사유를 그대로 씁니다.
 """
 
 # 투자 추천 기업이 있을 때의 목차
@@ -403,9 +405,19 @@ def _insert_table(body: str, placeholder: str, table: str, section: re.Pattern, 
     return body
 
 
-def insert_competitor_table(body: str, state: dict) -> str:
-    """5장의 자리표시자를 경쟁사 표로 바꾼다. 자리표시자가 없으면 5장 제목 아래에 넣는다."""
-    return _insert_table(body, COMPETITOR_PLACEHOLDER, build_competitor_table(state), COMPETITOR_SECTION_PATTERN, "경쟁사 표")
+def insert_competitor_table(body: str, state: dict, sources: list[dict] | None = None) -> str:
+    """5장의 자리표시자를 경쟁사 표로 바꾼다. 자리표시자가 없으면 5장 제목 아래에 넣는다.
+    sources를 주면 표 아래에 경쟁사 분석 출처 번호를 붙인다 (표의 점유율·비교 수치를 REFERENCE로 추적할 수 있게)."""
+    table = build_competitor_table(state)
+    numbers = competitor_source_numbers(sources or [])
+    if table and numbers:
+        table += "\n\n경쟁사 정보 출처: " + "".join(f"[{n}]" for n in numbers)
+    return _insert_table(body, COMPETITOR_PLACEHOLDER, table, COMPETITOR_SECTION_PATTERN, "경쟁사 표")
+
+
+def competitor_source_numbers(sources: list[dict]) -> list[int]:
+    """collect_sources 결과 중 경쟁사 분석(node=competitor)이 기록한 출처 번호."""
+    return [s["n"] for s in sources if any(r.get("node") == "competitor" for r in s.get("raw", []))]
 
 
 # ═════════════════════════════════════════════════════════════
@@ -676,7 +688,7 @@ def assemble_report(state: dict, body: str, sources: list[dict]) -> str:
     body = HR_PATTERN.sub("", body)                          # '---' 구분선은 PDF에 글자로 찍히므로 지운다
     if _is_recommend_mode(state):
         body = insert_score_table(body, state["scores"])
-        body = insert_competitor_table(body, state)
+        body = insert_competitor_table(body, state, sources)
         body, sources = keep_cited_sources(body, sources)   # REFERENCE에는 본문에서 인용한 출처만
     else:  # 추천 없음 보고서: 점수표·경쟁사 표 대신 2장에 후보별 결과 표(코드가 State에서 만든다)
         body = body.replace(PLACEHOLDER, "").replace(COMPETITOR_PLACEHOLDER, "")

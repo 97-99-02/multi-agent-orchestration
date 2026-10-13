@@ -29,10 +29,11 @@ def toc_titles():
 
 
 # ---------- 목차 ----------
-def test_toc_chapters_1_to_4_carry_the_four_perspectives():
-    titles = toc_titles()
-    for i, view in enumerate(quality.PERSPECTIVES, start=1):
-        assert titles[i].startswith(f"{i}.") and view in titles[i], (view, titles[i])
+def test_toc_analysis_chapters_are_checked_by_quality():
+    # 품질 평가가 인용 비율을 보는 분석 장 이름이 목차에 실제로 있어야 검사가 걸린다
+    titles = " ".join(toc_titles())
+    for heading in quality.ANALYSIS_HEADINGS:
+        assert heading in titles, heading
 
 
 def test_placeholders_sit_in_the_chapters_the_insert_patterns_look_for():
@@ -109,7 +110,7 @@ def test_quality_note_is_added_when_loops_are_exhausted():
     assert not out["eval_result"]["passed"]
     report = out["report"]
     assert report.index(quality.NOTE_HEADING) < report.index("## REFERENCE")
-    assert "관점 커버리지" in report
+    assert "중립성" in report
     assert quality.add_quality_note(report, out["eval_result"]["items"]) == report   # 두 번 넣지 않음
 
 
@@ -134,21 +135,6 @@ def test_split_citations_follow_renumbered_reference():
     assert [s["title"] for s in cited] == ["기사6", "기사7", "기사8", "기사9", "기사10", "기사11"]
 
 
-def test_explicit_info_lacking_chapter_counts_as_covered():
-    short = "## 4. 도메인 적용\n정부 과제를 수주했다. 고객사·PoC·공급 계약은 정보 부족이다[4].\n"
-    long_report = make_report_for_coverage(short)
-    assert "'도메인 적용'" not in " ".join(quality.check_coverage(long_report, recommend=True))
-    no_cite = make_report_for_coverage("## 4. 도메인 적용\n고객 정보 부족.\n")
-    assert "'도메인 적용' 장에 인용 없음" in quality.check_coverage(no_cite, recommend=True)   # 인용은 여전히 필요
-
-
-def make_report_for_coverage(domain_section):
-    filler = "근거 자료에 따르면 해당 내용은 공개 기사와 기관 보고서에서 함께 확인된다. " * 5
-    chapters = [f"## {i}. {name}\n2025년 기준 내용[1]. {filler}[2]\n" for i, name in
-                [(1, "사업 아이디어·기술 성숙도"), (2, "시장성"), (3, "이해관계자")]]
-    return "\n".join(chapters) + domain_section + "## REFERENCE\n- [1] A(2026). x\n- [2] B(2026). y\n- [4] C(2026). z\n"
-
-
 # ---------- PDF 분량 (최소 7장 ~ 최대 10장) ----------
 SHORT = ("## SUMMARY\n**결론:** 요약.\n## 1. 사업 아이디어·기술 성숙도\n" + "기술 내용 문장이다[1]. " * 40
          + "\n## 7. 사업 리스크\n리스크[1].\n## REFERENCE\n### 웹페이지\n- [1] 매체(2026). 기사. x.com, https://x.com\n")
@@ -167,3 +153,21 @@ def test_body_starts_on_new_page_after_summary(tmp_path):
     report = "## SUMMARY\n요약.\n## 1. 사업 아이디어·기술 성숙도\n짧은 본문[1].\n## REFERENCE\n### 웹페이지\n- [1] 매체(2026). 기사.\n"
     _, pages = reporter.export_report_pdf(report, output_dir=tmp_path, filename="p.pdf")
     assert pages >= 3                             # SUMMARY 쪽, 본문 쪽, REFERENCE 쪽
+
+
+def test_competitor_table_gets_source_numbers_and_keeps_them_in_reference():
+    state = {"competitor_analysis": {"competitors": [{"name": "Qualcomm", "tier": "선도 기업", "country": "미국",
+                                                      "product": "Hexagon", "comparison": "점유율 15.6%"}],
+                                     "differentiation": [], "competitive_risks": []},
+             "company": {"name": "A사"}}
+    sources = [{"n": 1, "label": "웹페이지", "title": "팀 기사", "raw": [{"node": "team"}]},
+               {"n": 2, "label": "웹페이지", "title": "경쟁 기사", "raw": [{"node": "competitor"}]}]
+    body = reporter.insert_competitor_table("## 5. 경쟁 구도\n{{COMPETITOR_TABLE}}\n해설[1].\n", state, sources)
+    assert "경쟁사 정보 출처: [2]" in body
+    _, cited = reporter.keep_cited_sources(body, sources)
+    assert "경쟁 기사" in [s["title"] for s in cited]          # 경쟁사 출처가 REFERENCE에 남는다
+
+
+def test_prompt_rules_for_rounded_amounts_and_marketing_words():
+    assert "'수십억 달러'" in reporter.SYSTEM_PROMPT and "어림 표현" in reporter.SYSTEM_PROMPT
+    assert "홍보 표현" in reporter.SYSTEM_PROMPT

@@ -84,7 +84,7 @@ class Scenario:
             self.calls.append("quality_eval")
             passed = self.quality.pop(0) if self.quality else True
             return {"eval_result": {"passed": passed, "report_version": state.get("report_version"),
-                                    "items": {"coverage": {"passed": passed, "reasons": []}}, "fix_instructions": ""}}
+                                    "items": {"bias_control": {"passed": passed, "reasons": []}}, "fix_instructions": ""}}
 
         return {
             "explorer": explorer,

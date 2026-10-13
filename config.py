@@ -58,7 +58,7 @@ QUALITY_CITED_RATIO = 0.8        # Groundedness: 분석 장에서 숫자가 든 
 QUALITY_MAX_UNVERIFIED = 2       # Groundedness: 사실 검증이 남긴 '(확인 필요)' 표시 허용 개수
 QUALITY_MIN_PUBLISHERS = 3       # 편향 통제: 인용된 출처의 발행처 수
 QUALITY_MAX_SOURCE_SHARE = 0.4   # 편향 통제: 출처 하나가 전체 인용에서 차지하는 비율 상한
-QUALITY_MIN_SECTION_CHARS = 200  # 관점 커버리지: 관점 장의 최소 분량 (표 제외)
+QUALITY_MAX_SAME_DAY_SHARE = 0.5 # 편향 통제: 인용한 웹 기사 중 같은 날 보도 비율 상한 (같은 발표의 재전송)
 
 # supervisor 실행 횟수 상한. 후보 1곳에 약 5회(탐색, 분석, 재작업, 판단 뒤마다 1회) × 최대 5곳 = 25,
 # 보고서 이후 약 12회(작성·사실 검증·재작성·품질 평가 루프) = 37 → 여유를 두어 40

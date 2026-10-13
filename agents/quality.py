@@ -1,10 +1,10 @@
 """보고서 품질 평가 노드 (담당: 김다은)
 
 보고서 생성 → 사실 검증 → 품질 평가 순서다. 사실 검증(verifier)이 수치·출처 번호를 원문과 대조한다면,
-품질 평가는 보고서 전체가 과제 기준 4개 항목을 지키는지 본다. 미달이면 supervisor가 reporter로 되돌린다.
+품질 평가는 보고서 전체가 아래 3개 항목을 지키는지 본다. 미달이면 supervisor가 reporter로 되돌린다.
 
 평가 방식: Hybrid
-- 코드 검사(결정적): 형식으로 판정할 수 있는 것 (인용 비율, 출처 번호, 과장·추천 표현, 발행처 수·편중, 관점 장 존재·분량)
+- 코드 검사(결정적): 형식으로 판정할 수 있는 것 (인용 비율, 출처 번호, 과장·홍보·비하 표현, 발행처 수·편중, 같은 날 보도 편중)
 - LLM Judge(내용): 코드로는 못 보는 것 (출처가 문장을 실제로 뒷받침하는지, 유리한 근거만 골랐는지 등).
   생성 모델(gpt-4.1-mini)과 다른 config.MODEL_JUDGE를 쓴다. 키가 없거나 호출이 실패하면 코드 검사만으로 판정한다
 - 항목은 코드 검사와 Judge를 모두 통과해야 통과다
@@ -13,7 +13,6 @@
 - groundedness  주장이 검색된 출처로 추적되는가
 - neutrality    근거 없는 과장·추천·비하 없이 기준표와 점수로만 결정을 설명하는가 (투자/보류 결정 자체는 judge.decide 규칙)
 - bias_control  단일 출처·한쪽 근거에 기대지 않는가 (확증편향 방지)
-- coverage      4개 관점(기술 성숙도, 시장성, 이해관계자, 도메인 적용)을 모두 다루는가
 
 출력: {"eval_result": {"passed", "report_version", "mode", "items": {항목: {"passed", "reasons", ...}},
                        "fix_instructions", "judge_ran"}}
@@ -28,30 +27,32 @@ from pydantic import BaseModel, Field
 from agents.reporter import REFERENCE_HEADING, printed_reference_numbers
 from agents.verifier import _evidence_json, check_citations, find_wording_problems
 from config import (LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MAX_QUALITY_LOOPS, MODEL_JUDGE, QUALITY_CITED_RATIO,
-                    QUALITY_MAX_SOURCE_SHARE, QUALITY_MAX_UNVERIFIED, QUALITY_MIN_PUBLISHERS,
-                    QUALITY_MIN_SECTION_CHARS)
+                    QUALITY_MAX_SAME_DAY_SHARE, QUALITY_MAX_SOURCE_SHARE, QUALITY_MAX_UNVERIFIED,
+                    QUALITY_MIN_PUBLISHERS)
 from obs import log_event
 
 logger = logging.getLogger(__name__)
 
 USE_LLM_JUDGE = True
-ITEMS = ("groundedness", "neutrality", "bias_control", "coverage")
-ITEM_LABELS = {"groundedness": "Groundedness", "neutrality": "중립성", "bias_control": "편향 통제",
-               "coverage": "관점 커버리지"}
+ITEMS = ("groundedness", "neutrality", "bias_control")
+ITEM_LABELS = {"groundedness": "Groundedness", "neutrality": "중립성", "bias_control": "편향 통제"}
 
-# 과제의 4개 관점 → 보고서 장 제목에 들어가야 하는 말 (reporter 목차와 맞춘다)
-PERSPECTIVES = ("기술 성숙도", "시장성", "이해관계자", "도메인 적용")
+# 인용 비율을 따지는 분석 장 (reporter 목차의 장 제목에 들어 있는 말)
+ANALYSIS_HEADINGS = ("기술 성숙도", "시장성", "이해관계자", "도메인 적용", "경쟁", "리스크")
 RISK_HEADING = "리스크"
+COMPETITION_HEADING = "경쟁 구도"
 
 # 중립성: 기준표·점수 밖의 추천 문구와 경쟁사 비하 (과장 표현은 verifier.OVERCLAIM_WORDS를 같이 쓴다)
 PROMOTIONAL = ("반드시 투자", "강력 추천", "강력히 추천", "투자해야 한다", "놓치지 말아야", "확실한 수익", "틀림없")
 DISPARAGING = ("열등", "상대가 되지", "뒤처진 기업", "경쟁력이 없는")
+# 수치 근거 없이 회사 보도자료에서 옮긴 홍보 표현
+MARKETING = ("최적화된 성능", "최적의 성능", "혁신적인", "획기적인", "탁월한", "최고의")
 
 CITATION = re.compile(r"\[(\d+)\]")
-REFERENCE_LINE = re.compile(r"^- \[(\d+)\] ([^(\n]+?)\(", re.MULTILINE)
+REFERENCE_LINE = re.compile(r"^- \[(\d+)\] ([^(\n]+?)\(([^)]*)\)", re.MULTILINE)
+DAY = re.compile(r"\d{4}-\d{2}-\d{2}")
 UNVERIFIED_MARK = "(확인 필요)"
 NOTE_HEADING = "### 품질 평가 미달 항목"
-NO_INFO = "정보 부족"
 
 
 # ---------- 보고서 읽기 ----------
@@ -86,7 +87,7 @@ def prose(text: str) -> str:
 
 
 def references(report: str) -> dict[int, dict]:
-    """REFERENCE의 [n] → {"publisher", "kind"}. kind는 바로 위 '### 기관 보고서'/'### 웹페이지'로 정한다."""
+    """REFERENCE의 [n] → {"publisher", "kind", "date"}. kind는 바로 위 '### 기관 보고서'/'### 웹페이지'로 정한다."""
     _, reference = split_report(report)
     refs, kind = {}, ""
     for line in reference.splitlines():
@@ -94,7 +95,7 @@ def references(report: str) -> dict[int, dict]:
             kind = "report" if "보고서" in line else "web"
         m = REFERENCE_LINE.match(line)
         if m:
-            refs[int(m.group(1))] = {"publisher": m.group(2).strip(), "kind": kind}
+            refs[int(m.group(1))] = {"publisher": m.group(2).strip(), "kind": kind, "date": m.group(3).strip()}
     return refs
 
 
@@ -107,13 +108,17 @@ def check_groundedness(report: str, recommend: bool) -> list[str]:
     body, _ = split_report(report)
     reasons = [f"REFERENCE에 없는 출처 번호 {p['value']}" for p in check_citations(report)]
     if recommend:
-        analysis = [t for h, t in sections(body) if any(k in h for k in (*PERSPECTIVES, RISK_HEADING, "경쟁"))]
+        analysis = [t for h, t in sections(body) if any(k in h for k in ANALYSIS_HEADINGS)]
         numeric = [p for t in analysis for p in paragraphs(t) if re.search(r"\d", CITATION.sub("", p))]
         if numeric:
             cited = sum(1 for p in numeric if CITATION.search(p))
             if cited / len(numeric) < QUALITY_CITED_RATIO:
                 reasons.append(f"분석 장에서 수치가 든 문단 {len(numeric)}개 중 인용이 있는 문단 {cited}개 "
                                f"({cited / len(numeric):.0%} < {QUALITY_CITED_RATIO:.0%})")
+        # 경쟁 구도 표(점유율·비교 수치)는 코드가 만들어 문단 검사에 안 걸리므로 장 단위로 인용을 확인한다
+        competition = [t for h, t in sections(body) if COMPETITION_HEADING in h]
+        if competition and not CITATION.search(competition[0]):
+            reasons.append("경쟁 구도 장에 인용 없음 (경쟁사 수치의 출처를 확인할 수 없음)")
     marks = body.count(UNVERIFIED_MARK)
     if marks > QUALITY_MAX_UNVERIFIED:
         reasons.append(f"사실 검증에서 확인되지 않은 표현 {marks}곳 (허용 {QUALITY_MAX_UNVERIFIED})")
@@ -126,6 +131,7 @@ def check_neutrality(report: str, state: dict) -> list[str]:
                if p["kind"] == "overclaim"]
     reasons += [f"기준표 밖 추천 표현 '{w}'" for w in PROMOTIONAL if w in body]
     reasons += [f"경쟁사 비하 표현 '{w}'" for w in DISPARAGING if w in body]
+    reasons += [f"수치 근거 없는 홍보 표현 '{w}'" for w in MARKETING if w in body]
     risk = [t for h, t in sections(body) if RISK_HEADING in h]
     if not risk or len(prose(risk[0])) < 100:
         reasons.append("리스크 장이 없거나 100자 미만 (리스크 축소)")
@@ -153,26 +159,15 @@ def check_bias(report: str, recommend: bool) -> list[str]:
     risk = [t for h, t in sections(body) if RISK_HEADING in h]
     if risk and not CITATION.search(risk[0]):
         reasons.append("리스크 장에 인용 없음 (불리한 근거 누락 여부 확인 불가)")
-    return reasons
-
-
-def check_coverage(report: str, recommend: bool) -> list[str]:
-    if not recommend:
-        return []   # 추천 기업이 없으면 기업 단위 4개 관점 평가 대상이 아니다
-    body, _ = split_report(report)
-    secs = sections(body)
-    reasons = []
-    for view in PERSPECTIVES:
-        found = [t for h, t in secs if view in h]
-        if not found:
-            reasons.append(f"'{view}' 관점 장 없음")
-            continue
-        text = prose(found[0])
-        # 자료가 없어 '정보 부족'이라고 밝힌 장은 그 관점을 다룬 것으로 본다 (분량을 채우려 지어내게 하지 않음)
-        if len(text) < QUALITY_MIN_SECTION_CHARS and NO_INFO not in text:
-            reasons.append(f"'{view}' 장 {len(text)}자 (최소 {QUALITY_MIN_SECTION_CHARS})")
-        if not CITATION.search(found[0]):
-            reasons.append(f"'{view}' 장에 인용 없음")
+    # 여러 매체가 같은 날 같은 발표를 옮긴 기사는 발행처가 달라도 독립 출처가 아니다 (보도자료 재전송)
+    web_days = [DAY.search(refs[n]["date"]).group(0) for n in set(cites)
+                if refs[n]["kind"] == "web" and DAY.search(refs[n]["date"])]
+    if len(web_days) >= 3:
+        day = max(set(web_days), key=web_days.count)
+        same = web_days.count(day)
+        if same >= 3 and same / len(web_days) > QUALITY_MAX_SAME_DAY_SHARE:
+            reasons.append(f"인용한 웹 기사 {len(web_days)}건 중 {same}건이 같은 날({day}) 보도 "
+                           f"(같은 발표의 재전송일 수 있어 독립 출처가 부족)")
     return reasons
 
 
@@ -182,7 +177,6 @@ def code_checks(report: str, state: dict) -> dict[str, list[str]]:
         "groundedness": check_groundedness(report, recommend),
         "neutrality": check_neutrality(report, state),
         "bias_control": check_bias(report, recommend),
-        "coverage": check_coverage(report, recommend),
     }
 
 
@@ -196,18 +190,17 @@ class QualityJudgement(BaseModel):
     groundedness: JudgeItem = Field(description="본문 주장(특히 수치·사실)이 인용한 출처와 분석 자료로 뒷받침되는가")
     neutrality: JudgeItem = Field(description="투자/보류 결정을 기준표 점수로만 설명하고, 리스크를 축소하거나 경쟁사를 깎아내리지 않는가")
     bias_control: JudgeItem = Field(description="분석 자료에 있는 약점·리스크·반대 근거를 빼고 유리한 근거만 쓰지 않았는가")
-    coverage: JudgeItem = Field(description="기술 성숙도·시장성·이해관계자·도메인 적용 장이 각각 채점 기준(개발 단계·성능, 시장 규모·성장률, 팀·투자사·경쟁사, 고객·PoC·공급 실적)을 실제로 다루는가")
 
 
-JUDGE_PROMPT = """너는 투자 평가 보고서의 품질 검토자다. 아래 [분석 자료]만 근거로 [보고서]를 4개 항목별로 판정하라.
+JUDGE_PROMPT = """너는 투자 평가 보고서의 품질 검토자다. 아래 [분석 자료]만 근거로 [보고서]를 3개 항목별로 판정하라.
 보고서 문장을 고치지 말고, 항목마다 통과 여부와 미달 사유만 적는다. 사유는 보고서의 해당 문장이나 장을 짚어 구체적으로 쓴다.
 투자/보류 결정은 규칙으로 정해진 것이므로 결정의 옳고 그름은 판정하지 않는다. 결정을 설명하는 방식만 본다.
 미달은 아래처럼 내용에 문제가 있을 때만 판정한다. 표현·용어 선택·문체·분량은 미달 사유가 아니다.
 - groundedness: 보고서의 사실·수치가 [분석 자료]나 인용한 출처와 다르거나, 자료에 없는 사실을 단정함
-- neutrality: 점수·기준표가 아닌 근거로 결정을 정당화하거나, 리스크를 축소하거나, 경쟁사를 깎아내림
-- bias_control: [분석 자료]에 있는 약점·리스크·반대 근거를 보고서에서 뺌
-- coverage: 관점 장이 없거나, [분석 자료]에 그 관점의 채점 근거가 있는데 장에서 다루지 않음
-자료에 없는 내용을 없다고 밝힌 장은(표현이 '정보 부족'이 아니어도) 그 관점을 다룬 것으로 본다.
+- neutrality: 점수·기준표가 아닌 근거로 결정을 정당화하거나, 리스크를 축소하거나, 경쟁사를 깎아내리거나,
+  수치 근거 없는 회사 홍보 문구(보도자료 어투)를 사실처럼 옮김
+- bias_control: [분석 자료]에 있는 약점·리스크·반대 근거를 보고서에서 뺌, 또는 한 발표를 옮긴 기사들에만 기댐
+자료에 없는 내용을 없다고 밝힌 것은 미달 사유가 아니다.
 {mode_note}
 
 [분석 자료 - JSON]
@@ -233,7 +226,7 @@ def _judge(judge_llm):
 
 def llm_checks(report: str, state: dict, judge_llm) -> QualityJudgement:
     mode_note = ("" if is_recommend(state) else
-                 "추천 기업 없음 보고서다. 관점 커버리지와 편향 통제는 보류 사유를 공정하게 정리했는지로만 본다.")
+                 "추천 기업 없음 보고서다. 편향 통제는 보류 사유를 공정하게 정리했는지로만 본다.")
     prompt = JUDGE_PROMPT.format(mode_note=mode_note, materials=_evidence_json(state)[:15000], report=report)
     chain = judge_llm.with_structured_output(QualityJudgement).with_retry(stop_after_attempt=LLM_ATTEMPTS)
     return chain.invoke(prompt)

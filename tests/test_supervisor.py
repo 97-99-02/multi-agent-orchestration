@@ -218,7 +218,7 @@ def test_quality_pass_ends():
 
 def test_quality_fail_at_loop_limit_ends():
     state = report_state(verify_result={"report_version": 1, "passed": True}, quality_loops=MAX_QUALITY_LOOPS,
-                         eval_result={"report_version": 1, "passed": False, "items": {"coverage": {"passed": False}}})
+                         eval_result={"report_version": 1, "passed": False, "items": {"bias_control": {"passed": False}}})
     nxt, why, _ = decide(state)
     assert nxt == END
     assert "한도 도달" in why
@@ -250,3 +250,16 @@ def test_node_returns_only_control_keys_and_logs_decision():
 def test_route_reads_next_nodes_and_ends_when_empty():
     assert sup.route({"next_nodes": ["market", "team"]}) == ["market", "team"]
     assert sup.route({"next_nodes": []}) == END
+
+
+
+def test_web_evidence_all_on_same_day_needs_independent_sources():
+    same_day = [{"company": "A사", "node": "team", "kind": "web", "publisher": p, "url": f"https://{p}.kr",
+                 "date": "2026-08-19"} for p in ("etnews", "mk")]
+    sources = [s for s in good_sources() if s["node"] != "team"] + same_day
+    nxt, why, upd = decide(analyzed(sources=sources))
+    assert nxt == ["team"] and "같은 날(2026-08-19)" in why
+    assert upd["rework_request"]["team"]["focus"] == ["publisher_diversity"]
+    other_day = same_day[:1] + [{**same_day[1], "date": "2026-10-07"}]
+    nxt, _, _ = decide(analyzed(sources=[s for s in good_sources() if s["node"] != "team"] + other_day))
+    assert nxt == ["judge"]

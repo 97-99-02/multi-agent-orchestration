@@ -46,8 +46,8 @@ def test_good_report_passes_all_code_checks():
 
 def test_report_parsing():
     refs = q.references(make_report())
-    assert refs[1] == {"publisher": "KDB미래전략연구소", "kind": "report"}
-    assert refs[3] == {"publisher": "전자신문", "kind": "web"}
+    assert refs[1] == {"publisher": "KDB미래전략연구소", "kind": "report", "date": "2024"}
+    assert refs[3] == {"publisher": "전자신문", "kind": "web", "date": "2026-06-01"}
 
 
 # ---------- Groundedness ----------
@@ -105,28 +105,12 @@ def test_risk_without_citation_fails_bias():
     assert any("리스크 장에 인용 없음" in r for r in result["items"]["bias_control"]["reasons"])
 
 
-# ---------- 관점 커버리지 ----------
-def test_missing_or_thin_perspective_fails_coverage():
-    report = make_report(domain="", stake="## 3. 이해관계자\n대표 15년 경력.\n")
-    reasons = node(report)["items"]["coverage"]["reasons"]
-    assert "'도메인 적용' 관점 장 없음" in reasons
-    assert any("'이해관계자' 장" in r and "최소" in r for r in reasons)
-    assert "'이해관계자' 장에 인용 없음" in reasons
-
-
-def test_old_rag_toc_fails_coverage():
-    # RAG 과제 목차(사업 아이디어 / 시장 규모 / 팀의 구성)는 관점 이름이 없어 커버리지 미달 → 9단계에서 목차 변경
-    report = make_report(tech=section("1. 사업 아이디어 (핵심 컨셉)"), market=section("2. 시장 규모"),
-                         stake=section("3. 팀의 구성"), domain="")
-    assert len(node(report)["items"]["coverage"]["reasons"]) == 4
-
-
 def test_no_recommend_report_skips_company_level_checks():
     report = ("## SUMMARY\n추천 기업 없음.\n## 1. 평가 개요\n후보 2곳 평가.\n"
               f"## 3. 사업 리스크\n{FILLER}\n## 4. 한계점\n정보 부족.\n")
     result = node(report, state=HOLD)
     assert result["mode"] == "no_recommend"
-    assert result["items"]["coverage"]["passed"] and result["items"]["bias_control"]["passed"]
+    assert result["items"]["bias_control"]["passed"]
     assert result["passed"]
 
 
@@ -146,18 +130,18 @@ class FakeJudge:
         if self.error:
             raise self.error
         return q.QualityJudgement(**{k: q.JudgeItem(passed=k not in self.fail,
-                                                    reasons=["도메인 적용 장에 고객 실적 근거 없음"] if k in self.fail else [])
+                                                    reasons=["자료의 양산 지연 리스크가 빠짐"] if k in self.fail else [])
                                      for k in q.ITEMS})
 
 
 def test_judge_failure_fails_item_even_if_code_passes():
-    judge = FakeJudge(fail={"coverage"})
+    judge = FakeJudge(fail={"bias_control"})
     result = node(make_report(), judge_llm=judge)
-    item = result["items"]["coverage"]
+    item = result["items"]["bias_control"]
     assert result["judge_ran"] and not result["passed"]
     assert item["code_passed"] is True and item["judge_passed"] is False
-    assert item["reasons"] == ["(Judge) 도메인 적용 장에 고객 실적 근거 없음"]
-    assert result["fix_instructions"] == "- [관점 커버리지] (Judge) 도메인 적용 장에 고객 실적 근거 없음"
+    assert item["reasons"] == ["(Judge) 자료의 양산 지연 리스크가 빠짐"]
+    assert result["fix_instructions"] == "- [편향 통제] (Judge) 자료의 양산 지연 리스크가 빠짐"
     assert "[보고서]" in judge.prompts[0]
 
 
@@ -175,3 +159,31 @@ def test_judge_error_falls_back_to_code_checks():
 def test_no_api_key_skips_judge(monkeypatch):
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     assert q._judge(None) is None
+
+
+def test_items_are_three():
+    assert q.ITEMS == ("groundedness", "neutrality", "bias_control")
+    assert set(node(make_report())["items"]) == set(q.ITEMS)
+
+
+# ---------- 다은님 피드백 반영 ----------
+def test_competition_chapter_without_citation_fails_groundedness():
+    competition = "## 5. 경쟁 구도\n| 구분 | 기업 |\n|---|---|\n| 선도 기업 | Qualcomm 15.6% |\n\n경쟁 의미 해설.\n"
+    reasons = node(make_report(market=section("2. 시장성", "[2][4]", "시장 규모") + competition))["items"]["groundedness"]["reasons"]
+    assert any("경쟁 구도 장에 인용 없음" in r for r in reasons)
+    cited = competition + "경쟁사 정보 출처: [3][5]\n"
+    reasons = node(make_report(market=section("2. 시장성", "[2][4]", "시장 규모") + cited))["items"]["groundedness"]["reasons"]
+    assert not any("경쟁 구도" in r for r in reasons)
+
+
+def test_marketing_phrase_fails_neutrality():
+    result = node(make_report(summary="## SUMMARY\nNPU는 최적화된 성능을 제공한다.\n"))
+    assert any("홍보 표현 '최적화된 성능'" in r for r in result["items"]["neutrality"]["reasons"])
+
+
+def test_same_day_press_reprints_fail_bias():
+    refs = ("## REFERENCE\n### 기관 보고서\n- [1] KDB(2024). 동향.\n- [2] ETRI(2026). 동향.\n### 웹페이지\n"
+            "- [3] 전자신문(2026-08-19). 시리즈A. etnews.com\n- [4] 매일경제(2026-08-19). 시리즈A. mk.co.kr\n"
+            "- [5] 뉴스1(2026-08-19). 시리즈A. news1.kr\n- [6] 더벨(2026-01-15). 기사. thebell.co.kr\n")
+    reasons = node(make_report(reference=refs))["items"]["bias_control"]["reasons"]
+    assert any("4건 중 3건이 같은 날(2026-08-19)" in r for r in reasons)

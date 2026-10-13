@@ -48,6 +48,8 @@ TECH_REQUIRED = {
 
 # 편향 통제: 한 관점의 근거가 발행처 1곳에만 기대면 부족으로 본다
 MIN_PUBLISHERS = 2
+# 편향 통제: 웹 근거가 모두 같은 날 보도면(같은 발표를 여러 매체가 옮긴 경우) 독립 출처가 아니다
+MIN_WEB_FOR_DATE_CHECK = 2
 
 
 def _publisher(s: dict) -> str:
@@ -63,6 +65,14 @@ def publishers_of(sources: list[dict], company: str, node: str) -> set[str]:
     found = {_publisher(s) for s in sources if s.get("company") == company and s.get("node") == node}
     found.discard("")
     return found
+
+
+def single_day_web(sources: list[dict], company: str, node: str) -> str:
+    """현재 기업·관점의 웹 근거가 2건 이상이고 모두 같은 날 보도면 그 날짜, 아니면 빈 문자열."""
+    days = [s.get("date", "")[:10] for s in sources
+            if s.get("company") == company and s.get("node") == node and s.get("kind") == "web"]
+    days = [d for d in days if len(d) == 10]   # 날짜 미상·연도만 있는 출처는 판단에서 뺀다
+    return days[0] if len(days) >= MIN_WEB_FOR_DATE_CHECK and len(set(days)) == 1 else ""
 
 
 def check_evidence(node: str, analysis: dict, sources: list[dict], company: str) -> dict:
@@ -93,8 +103,12 @@ def check_evidence(node: str, analysis: dict, sources: list[dict], company: str)
 
     if not analysis.get("failed"):
         pubs = publishers_of(sources, company, node)
+        day = single_day_web(sources, company, node)
         if len(pubs) < MIN_PUBLISHERS:
             reasons.append(f"근거 발행처 {len(pubs)}곳")
+            focus.append("publisher_diversity")
+        elif day:
+            reasons.append(f"웹 근거가 모두 같은 날({day}) 보도")
             focus.append("publisher_diversity")
     return {"sufficient": not reasons, "reason": ", ".join(reasons) or "충분", "focus": focus}
 

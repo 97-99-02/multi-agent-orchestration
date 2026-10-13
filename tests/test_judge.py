@@ -293,3 +293,14 @@ def test_history_skips_broken_lines(isolated_log):
     good = json.dumps({"company": "A", "total": 70, "decision": "투자", "eval_version": "v"}, ensure_ascii=False)
     isolated_log.write_bytes((good + "\n[1, 2]\n" + good[:-5]).encode("utf-8") + "평가".encode("utf-8")[:-1])
     assert len(judge.past_records("A", "v")) == 1
+
+
+
+def test_traction_capped_without_public_revenue_or_contracts():
+    # 정부 과제·MOU만 있고 공개 매출·계약이 비면 실적·고객 검증은 최대 2점 (평가표 '근거 없으면 최대 2점')
+    no_contract = {**STATE, "tech_summary": {"public_revenue_contracts": []}}
+    items, _, _ = evaluate(card(traction=item(3)), no_contract)
+    assert items["traction"]["score"] == 2 and items["traction"]["insufficient"]
+    with_contract = {**STATE, "tech_summary": {"public_revenue_contracts": ["2025년 공급 계약"]}}
+    items, _, _ = evaluate(card(traction=item(3)), with_contract)
+    assert items["traction"]["score"] == 3
