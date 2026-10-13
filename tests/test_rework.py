@@ -5,11 +5,18 @@
 """
 from types import SimpleNamespace
 
+import pytest
 from langchain_core.documents import Document
 
+import obs
 from agents import competitor, market, team
 from agents import tech_summary as tech
 from agents.rework import previous, rework_of, union
+
+
+@pytest.fixture(autouse=True)
+def tmp_log_dir(tmp_path, monkeypatch):
+    monkeypatch.setattr(obs, "LOG_DIR", tmp_path / "decisions")
 
 
 def rework_state(node, focus, **extra):
@@ -60,7 +67,9 @@ def test_tech_node_rework_uses_rework_queries_and_keeps_previous_facts(monkeypat
     assert out["core_chips"] == ["X1 NPU"]                         # 이전에 확인한 사실 유지
     assert "core_chips" not in out["missing_fields"] and "development_stage" in out["missing_fields"]
     assert out["industry_context"] == [{"text": "업계 기준"}]
-    assert out["diagnostics"]["rework"]["focus"] == ["development_stage"]
+    assert "diagnostics" not in out
+    [event] = obs.read_events(None, kind="diagnostics")            # 진단은 결정 로그로 (7단계)
+    assert event["data"]["rework"]["focus"] == ["development_stage"]
 
 
 def test_tech_merge_adds_new_facts_without_duplicates():

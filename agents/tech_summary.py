@@ -3,6 +3,7 @@
 기업별 칩·공정·개발 단계·성능·매출·계약은 공개 웹 자료에서 수집한다.
 Chroma tech 보고서는 업계 기준과 기술적 의미를 해석하는 데 사용한다.
 각 기업 사실과 업계 해석의 근거를 따로 검증한 뒤 State에 넣는다.
+검색어·버린 주장 등 진단 정보는 State에 넣지 않고 obs.log_diagnostics로 결정 로그에 남긴다.
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from agents.rework import previous, rework_of, union
+from obs import log_diagnostics
 from agents.web import search_many, source_date, to_source as web_to_source
 from config import LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MODEL_ANALYZE
 from rag.retriever import get_retriever, to_source as report_to_source
@@ -442,11 +444,13 @@ def tech_summary_node(state: dict) -> dict:
         "field_status": {field: "supported" if summary[field] else "not_found" for field in FIELDS},
         "industry_context": context,
         "industry_context_status": context_status,
-        "diagnostics": {"web_queries": queries, "retry_queries": retry_queries,
-                        "retrieved_web": len(items), "selected_web": len(evidence),
-                        "accepted_claims": len(claims), "rejected_claims": rejected,
-                        "rag": rag_diagnostics, "rework": rework},
     })
+    # 검색어·버린 주장 목록 같은 진단은 State가 아니라 결정 로그에 남긴다 (체크포인트마다 저장되는 State 크기를 줄임)
+    log_diagnostics(state.get("trace_id"), "tech_summary", name, {
+        "web_queries": queries, "retry_queries": retry_queries,
+        "retrieved_web": len(items), "selected_web": len(evidence),
+        "accepted_claims": len(claims), "rejected_claims": rejected,
+        "rag": rag_diagnostics, "rework": rework})
     prev = previous(state, "tech_summary") if rework else None
     if prev:
         summary = _merge_previous(prev, summary)

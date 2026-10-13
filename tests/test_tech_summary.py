@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, patch
 
 from langchain_core.documents import Document
 
+import obs
 from agents import tech_summary as tech
 from config import EMBEDDING_MODEL
 from rag import embeddings
@@ -245,6 +246,7 @@ class TechSummaryTests(unittest.TestCase):
                            evidence_id=0, quote="2026년 3월 테이프아웃을 완료했다")
         with (patch.object(tech, "get_retriever", side_effect=FileNotFoundError("vectorstore 없음")),
               patch.object(tech, "search_many", return_value=[web]),
+              patch.object(obs, "LOG_DIR", Path(tempfile.mkdtemp()) / "decisions"),
               patch.object(tech, "_llm") as llm):
             llm.side_effect = lambda schema: Chain({
                 tech.Relevance: tech.Relevance(relevant_ids=[0], rewrite_query=""),
@@ -252,11 +254,14 @@ class TechSummaryTests(unittest.TestCase):
                 tech.Grounding: tech.Grounding(verdicts=[tech.Verdict(claim_id=0, supported=True)]),
             }[schema])
             result = tech.tech_summary_node({"company": {"name": "테스트칩"}})
+            # 진단 정보는 State가 아니라 결정 로그에 남는다
+            [event] = obs.read_events(None, kind="diagnostics")
         summary = result["tech_summary"]
         self.assertEqual(summary["development_stage"], [claim.text])
         self.assertEqual(summary["industry_context_status"], "retrieval_unavailable")
         self.assertEqual(summary["industry_context"], [])
-        self.assertIn("vectorstore", summary["diagnostics"]["rag"]["error"])
+        self.assertNotIn("diagnostics", summary)
+        self.assertIn("vectorstore", event["data"]["rag"]["error"])
         self.assertEqual([s["kind"] for s in result["sources"]], ["web"])
 
     def test_context_requires_valid_web_fact_and_report_quote_and_grounding(self):
