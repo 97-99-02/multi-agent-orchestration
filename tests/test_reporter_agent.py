@@ -116,3 +116,34 @@ def test_quality_note_is_added_when_loops_are_exhausted():
 def test_no_quality_note_before_loop_limit():
     out = quality.quality_eval_node({**INVEST, "quality_loops": MAX_QUALITY_LOOPS - 1}, judge_llm=False)
     assert "report" not in out
+
+
+# ---------- 11단계 1회차 실행에서 찾은 것 ----------
+def test_grouped_citations_are_split_before_renumbering():
+    assert reporter.split_grouped_citations("장벽이 높다[6,7].") == "장벽이 높다[6][7]."
+    assert reporter.split_grouped_citations("경쟁[8, 9,10,11]") == "경쟁[8][9][10][11]"
+    assert reporter.split_grouped_citations("성장[3-5]") == "성장[3][4][5]"
+    assert reporter.split_grouped_citations("기간[2024-2030] 전망[2]") == "기간[2024-2030] 전망[2]"   # 연도는 그대로
+
+
+def test_split_citations_follow_renumbered_reference():
+    sources = [{"n": n, "label": "웹페이지", "title": f"기사{n}"} for n in range(1, 12)]
+    body = reporter.split_grouped_citations("A[6,7]. B[8,9,10,11].")
+    body, cited = reporter.keep_cited_sources(body, sources)
+    assert body == "A[1][2]. B[3][4][5][6]."                       # 본문 번호와 REFERENCE 번호가 같이 바뀐다
+    assert [s["title"] for s in cited] == ["기사6", "기사7", "기사8", "기사9", "기사10", "기사11"]
+
+
+def test_explicit_info_lacking_chapter_counts_as_covered():
+    short = "## 4. 도메인 적용\n정부 과제를 수주했다. 고객사·PoC·공급 계약은 정보 부족이다[4].\n"
+    long_report = make_report_for_coverage(short)
+    assert "'도메인 적용'" not in " ".join(quality.check_coverage(long_report, recommend=True))
+    no_cite = make_report_for_coverage("## 4. 도메인 적용\n고객 정보 부족.\n")
+    assert "'도메인 적용' 장에 인용 없음" in quality.check_coverage(no_cite, recommend=True)   # 인용은 여전히 필요
+
+
+def make_report_for_coverage(domain_section):
+    filler = "근거 자료에 따르면 해당 내용은 공개 기사와 기관 보고서에서 함께 확인된다. " * 5
+    chapters = [f"## {i}. {name}\n2025년 기준 내용[1]. {filler}[2]\n" for i, name in
+                [(1, "사업 아이디어·기술 성숙도"), (2, "시장성"), (3, "이해관계자")]]
+    return "\n".join(chapters) + domain_section + "## REFERENCE\n- [1] A(2026). x\n- [2] B(2026). y\n- [4] C(2026). z\n"

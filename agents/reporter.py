@@ -74,6 +74,7 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
 8. '투자 판단 결과' 장에는 점수표를 직접 쓰지 말고, 표가 들어갈 자리에 {{SCORE_TABLE}} 한 줄만 쓰세요.
    그 아래에 항목별 근거를 문장으로 해설합니다. (표는 코드가 자동으로 채웁니다.)
 9. 수치나 사실을 말하는 문장 끝에는 [분석 자료]의 sources_for_citation에 있는 번호를 [1]처럼 붙이세요.
+   번호가 여러 개면 [1][2]처럼 하나씩 따로 씁니다. ([1,2]·[1-2]처럼 묶지 않습니다)
    목록에 없는 번호는 절대 쓰지 말고, 근거 출처가 없으면 번호를 붙이지 않습니다.
 10. '경쟁 구도' 장에는 경쟁사 목록·차별점·경쟁 리스크를 직접 나열하지 말고, 그 자리에 {{COMPETITOR_TABLE}} 한 줄만 쓰세요.
     (구도 그림과 차별점·리스크 목록은 코드가 자동으로 채웁니다.) 그 아래에는 이 경쟁 구도가 투자 판단에
@@ -208,6 +209,8 @@ SECTION2_PATTERN = re.compile(r"^##\s*2\.[^\n]*\n", re.MULTILINE)
 COMPETITOR_SECTION_PATTERN = re.compile(r"^##\s*5\.[^\n]*\n", re.MULTILINE)   # 5장 경쟁 구도
 SCORE_SECTION_PATTERN = re.compile(r"^##\s*6\.[^\n]*\n", re.MULTILINE)        # 6장 투자 판단 결과
 HR_PATTERN = re.compile(r"^[ \t]*(?:[-*_][ \t]*){3,}$\n?", re.MULTILINE)  # AI가 넣는 '---' 구분선
+# AI가 묶어 쓴 [6,7]·[8-11]. 세 자리 이하만 (대괄호 안 연도 범위 [2024-2030]은 인용이 아니다)
+GROUPED_CITATION_PATTERN = re.compile(r"\[(\d{1,3}(?:\s*[,~\-]\s*\d{1,3})+)\]")
 LEADING_TIER = "선도 기업"                            # 경쟁 구도에서 왼쪽(진입 위협)에 놓을 구분
 PEER_TIER = "동급 기업"                               # 오른쪽(직접 경쟁)에 놓을 구분
 TARGET_TIER = "평가 대상"
@@ -645,9 +648,27 @@ def evaluation_rules() -> dict:
     }
 
 
+def split_grouped_citations(body: str) -> str:
+    """[6,7]·[8-11]을 [6][7]·[8][9][10][11]로 푼다.
+    왜: 번호를 다시 매길 때 [n] 형식만 바뀌어, 묶어 쓴 번호는 옛 번호로 남아 REFERENCE와 어긋났다
+    (사실 검증도 '6,7'을 자료에 없는 수치로 표시했다).
+    """
+    def expand(m):
+        numbers = []
+        for part in re.split(r"\s*,\s*", m.group(1)):
+            bounds = re.split(r"\s*[~\-]\s*", part)
+            if len(bounds) == 2 and int(bounds[0]) <= int(bounds[1]) <= int(bounds[0]) + 20:
+                numbers += range(int(bounds[0]), int(bounds[1]) + 1)
+            else:
+                numbers += [int(b) for b in bounds]
+        return "".join(f"[{n}]" for n in numbers)
+    return GROUPED_CITATION_PATTERN.sub(expand, body)
+
+
 def assemble_report(state: dict, body: str, sources: list[dict]) -> str:
     """AI가 쓴 본문에 코드가 만든 부분(점수표, REFERENCE)을 합쳐 완성본을 만든다."""
     body = REFERENCE_SECTION_PATTERN.sub("", body).rstrip()  # AI가 쓴 REFERENCE는 지운다(진짜는 코드가)
+    body = split_grouped_citations(body)                     # [6,7] → [6][7] (번호 다시 매기기 전에)
     body = HR_PATTERN.sub("", body)                          # '---' 구분선은 PDF에 글자로 찍히므로 지운다
     if _is_recommend_mode(state):
         body = insert_score_table(body, state["scores"])

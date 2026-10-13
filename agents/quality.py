@@ -30,6 +30,7 @@ from agents.verifier import _evidence_json, check_citations, find_wording_proble
 from config import (LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MAX_QUALITY_LOOPS, MODEL_JUDGE, QUALITY_CITED_RATIO,
                     QUALITY_MAX_SOURCE_SHARE, QUALITY_MAX_UNVERIFIED, QUALITY_MIN_PUBLISHERS,
                     QUALITY_MIN_SECTION_CHARS)
+from obs import log_event
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,7 @@ CITATION = re.compile(r"\[(\d+)\]")
 REFERENCE_LINE = re.compile(r"^- \[(\d+)\] ([^(\n]+?)\(", re.MULTILINE)
 UNVERIFIED_MARK = "(확인 필요)"
 NOTE_HEADING = "### 품질 평가 미달 항목"
+NO_INFO = "정보 부족"
 
 
 # ---------- 보고서 읽기 ----------
@@ -166,7 +168,8 @@ def check_coverage(report: str, recommend: bool) -> list[str]:
             reasons.append(f"'{view}' 관점 장 없음")
             continue
         text = prose(found[0])
-        if len(text) < QUALITY_MIN_SECTION_CHARS:
+        # 자료가 없어 '정보 부족'이라고 밝힌 장은 그 관점을 다룬 것으로 본다 (분량을 채우려 지어내게 하지 않음)
+        if len(text) < QUALITY_MIN_SECTION_CHARS and NO_INFO not in text:
             reasons.append(f"'{view}' 장 {len(text)}자 (최소 {QUALITY_MIN_SECTION_CHARS})")
         if not CITATION.search(found[0]):
             reasons.append(f"'{view}' 장에 인용 없음")
@@ -199,6 +202,12 @@ class QualityJudgement(BaseModel):
 JUDGE_PROMPT = """너는 투자 평가 보고서의 품질 검토자다. 아래 [분석 자료]만 근거로 [보고서]를 4개 항목별로 판정하라.
 보고서 문장을 고치지 말고, 항목마다 통과 여부와 미달 사유만 적는다. 사유는 보고서의 해당 문장이나 장을 짚어 구체적으로 쓴다.
 투자/보류 결정은 규칙으로 정해진 것이므로 결정의 옳고 그름은 판정하지 않는다. 결정을 설명하는 방식만 본다.
+미달은 아래처럼 내용에 문제가 있을 때만 판정한다. 표현·용어 선택·문체·분량은 미달 사유가 아니다.
+- groundedness: 보고서의 사실·수치가 [분석 자료]나 인용한 출처와 다르거나, 자료에 없는 사실을 단정함
+- neutrality: 점수·기준표가 아닌 근거로 결정을 정당화하거나, 리스크를 축소하거나, 경쟁사를 깎아내림
+- bias_control: [분석 자료]에 있는 약점·리스크·반대 근거를 보고서에서 뺌
+- coverage: 관점 장이 없거나, [분석 자료]에 그 관점의 채점 근거가 있는데 장에서 다루지 않음
+자료에 없는 내용을 없다고 밝힌 장은(표현이 '정보 부족'이 아니어도) 그 관점을 다룬 것으로 본다.
 {mode_note}
 
 [분석 자료 - JSON]
@@ -267,6 +276,10 @@ def quality_eval_node(state: dict, judge_llm=None) -> dict:
         items[k] = {"passed": not code[k] and (verdict is None or verdict.passed), "reasons": reasons,
                     "code_passed": not code[k], "judge_passed": None if verdict is None else verdict.passed}
     passed = all(v["passed"] for v in items.values())
+    # 회차마다 미달 사유를 결정 로그에 남긴다 (보고서에는 마지막 회차 사유만 남으므로)
+    log_event(state.get("trace_id"), "quality", "quality_eval", report_version=state.get("report_version"),
+              passed=passed, failed={k: v["reasons"] for k, v in items.items() if not v["passed"]},
+              judge_ran=judgement is not None)
     logger.info("[품질 평가] v%s %s: %s", state.get("report_version"), "통과" if passed else "미달",
                 {k: v["passed"] for k, v in items.items()})
     out = {"eval_result": {

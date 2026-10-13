@@ -79,5 +79,6 @@ def main():
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-    logging.getLogger("httpx").setLevel(logging.WARNING)   # API 요청마다 찍히는 로그는 끈다
+    for name in ("httpx", "httpx2"):   # API 요청마다 찍히는 로그는 끈다
+        logging.getLogger(name).setLevel(logging.WARNING)
     main()
