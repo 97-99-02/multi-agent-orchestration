@@ -1143,6 +1143,20 @@ def _column_box(title: str, caption: str, cards: list, width: float, background:
     return box
 
 
+CARD_TEXT_CHARS, CARD_PRODUCT_CHARS = 110, 60   # 경쟁 구도 그림 카드에 싣는 설명·제품 글자 수
+SENTENCE_END = re.compile(r"(?<=[.!?])\s|(?<=다\.)")
+
+
+def _short(text: str, limit: int) -> str:
+    """첫 문장만, 그래도 길면 limit 글자에서 단어 단위로 자른다."""
+    text = (text or "").strip()
+    first = SENTENCE_END.split(text, maxsplit=1)[0].strip() if text else ""
+    if len(first) <= limit:
+        return first
+    cut = first[:limit].rsplit(" ", 1)[0]
+    return cut.rstrip(",·;:") + "…"
+
+
 def _landscape(block: list[str], styles: dict, width: float) -> Table:
     """경쟁 구도 그림: [선도 기업(진입 위협)] ← [평가 대상] → [동급 기업(직접 경쟁)]."""
     rows = _md_rows(block)[1:]   # 첫 줄은 제목
@@ -1152,6 +1166,9 @@ def _landscape(block: list[str], styles: dict, width: float) -> Table:
         groups[tier if tier in groups else PEER_TIER].append((name, country, product, comparison))
 
     def card(name, country, product, comparison):
+        # 경쟁사 설명이 길면(영문 소개문 등) 그림이 한 쪽 남은 공간보다 커져 통째로 다음 쪽으로 넘어가고
+        # 앞 쪽이 비었다. 그림 카드에는 첫 문장만 짧게 싣는다 (보고서 본문 표에는 전체가 남아 있다)
+        product, comparison = _short(product, CARD_PRODUCT_CHARS), _short(comparison, CARD_TEXT_CHARS)
         meta = " · ".join(v for v in (country, product) if v and v != "–")
         text = f"<b>{_inline(name)}</b>" + (f' <font size="7.5" color="{MUTED}">{_inline(meta)}</font>' if meta else "")
         if comparison and comparison != "–":
@@ -1302,6 +1319,11 @@ def render_blocks(blocks: list[dict], font: str, bold: str, width: float, has_da
             flow += content_flowables(lines, small, width, font)
         elif level == 2:
             body = content_flowables(lines, normal, width, font)
+            if "경쟁 구도" in title:
+                # 경쟁 구도 그림·패널은 쪽을 나눌 수 없는 큰 덩어리라, 먼저 오면 앞 쪽 남은 공간이 통째로 비었다.
+                # 해설 문단을 먼저 두어 남은 공간을 채우고 그림은 그 뒤에 둔다
+                text = [f for f in body if not isinstance(f, (Table, Spacer))]
+                body = text + [f for f in body if f not in text]
             opener = ([CondPageBreak(USABLE_PAGE_HEIGHT * PAGE_BREAK_ROOM)] if any(k in title for k in PAGE_BREAK_BEFORE)
                       else []) + [Spacer(1, _gap(SECTION_GAP))]
             flow += opener + [KeepTogether([_heading2(title, normal, width), Spacer(1, _gap(HEADING_GAP))] + body[:2])]

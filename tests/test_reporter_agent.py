@@ -316,3 +316,11 @@ def test_reporter_node_rewrites_only_flagged_chapter():
     report = reporter.reporter_node(state, llm=llm)["report"]
     assert "[부분 재작성]" in llm.prompts[0] and "{{SCORE_TABLE}}" in llm.prompts[0]
     assert "원래 개요." in report and "원래 한계." in report and "고친 리스크." in report
+
+
+def test_landscape_card_text_is_shortened_to_first_sentence():
+    long = ("Snapdragon processors with integrated NPUs for edge AI. Qualcomm has a 15.6% share of the market "
+            "and keeps expanding into automotive and PC segments with new chips.")
+    assert reporter._short(long, 110) == "Snapdragon processors with integrated NPUs for edge AI."
+    assert reporter._short("가" * 50 + " " + "나" * 80, 110).endswith("…")
+    assert reporter._short("짧은 설명", 110) == "짧은 설명"
