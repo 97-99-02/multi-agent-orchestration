@@ -10,6 +10,7 @@ LLM: config.MODEL_ANALYZE - 문서 조각에서 수치·수요 요인·리스크
     market_risks, summary, searched(검색한 문서 유형), info_insufficient(설계 3.5 정보 부족 표시)
 """
 import re
+from datetime import date
 from typing import Literal
 
 from langchain_openai import ChatOpenAI
@@ -126,6 +127,38 @@ def number_in_source(value: str, text: str) -> bool:
     return bool(nums) and all(n in body for n in nums)
 
 
+YEAR_PATTERN = re.compile(r"(?:19|20)\d{2}")
+YEAR_UNKNOWN = "연도 미상"
+FORECAST_WORDS = ("전망", "예상", "예측", "추정")
+FORECAST_WINDOW = 20   # 값 바로 뒤 이 글자 수 안에 전망 표현이 있으면 전망 수치 (연도를 모를 때만 쓴다)
+
+
+def year_in_source(year: str, text: str) -> bool:
+    """기준 연도가 원문에 있는가. '2026'뿐 아니라 '’26년'·'26년' 같은 두 자리 표기도 인정한다.
+    왜: 원문 연도 글자가 깨진 조각('‘2/HxT67년')에서 LLM이 연도를 2026으로 채웠고, 사실 검증은 연도를 검사하지 않는다."""
+    body = re.sub(r"\s", "", text)
+    return all(y in body or f"{y[2:]}년" in body or any(f"{q}{y[2:]}" in body for q in "'’‘")
+               for y in YEAR_PATTERN.findall(year))
+
+
+def is_forecast(year: str, value: str, text: str, this_year: int | None = None) -> bool:
+    """전망 수치인가: 기준 연도가 올해 이후이거나, 연도를 모르는데 원문에서 값 바로 뒤에 '전망·예상'이 붙어 있다."""
+    years = [int(y) for y in YEAR_PATTERN.findall(year)]
+    if years:
+        return max(years) >= (this_year or date.today().year)
+    body, v = _compact(text), _compact(value)
+    pos = body.find(v)
+    return pos >= 0 and any(w in body[pos + len(v): pos + len(v) + FORECAST_WINDOW] for w in FORECAST_WORDS)
+
+
+def drop_unverified_year(summary: str, year: str, value: str) -> str:
+    """summary에서 원문에 없는 연도가 붙은 수치를 '값(연도 미상)'으로 바꾼다 (보고서가 summary의 연도를 옮기지 않게)."""
+    if not year:
+        return summary
+    pattern = re.compile(rf"{re.escape(year)}년\s*(?:에는|에|까지)?\s*{re.escape(value)}")
+    return pattern.sub(f"{value}({YEAR_UNKNOWN})", summary)
+
+
 def has_unit(kind: str, value: str) -> bool:
     """시장규모는 통화 단위, 성장률은 %가 값에 있는가."""
     return bool(UNIT_PATTERNS[kind].search(value))
@@ -162,12 +195,17 @@ def extract(name: str, segment: str, docs: list) -> tuple[MarketAnalysis, list[d
         d = docs[f.evidence_id]
         if not has_unit(f.kind, f.value) or not number_in_source(f.value, d.page_content):
             continue
-        figures.append({
+        figure = {
             **f.model_dump(),
             "segment_specific": is_segment_specific(f.scope, d.page_content, segment),
             "sub_market": is_sub_market(f.scope, segment),
             "source": f"{d.metadata.get('title', '')} p.{d.metadata.get('page', '')}",
-        })
+        }
+        if not year_in_source(f.year, d.page_content):   # 원문에서 확인되지 않은 연도는 쓰지 않는다
+            a.summary = drop_unverified_year(a.summary, f.year, f.value)
+            figure.update(year="", year_note=YEAR_UNKNOWN)
+        figure["forecast"] = is_forecast(figure["year"], f.value, d.page_content)
+        figures.append(figure)
     return a, figures
 
 

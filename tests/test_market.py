@@ -102,3 +102,46 @@ def test_sub_market_figures_alone_are_not_sufficient():
     wide_growth = {"kind": "성장률", "segment_specific": True, "sub_market": False}
     assert not market.is_sufficient([wide, pc_growth])
     assert market.is_sufficient([wide, pc_growth, wide_growth])
+
+
+# ---------- 원문 연도 확인, 전망 수치 표시 ----------
+# KDB 보고서 p.16 실제 추출 결과: 목표 연도 글자가 깨져 있다 (LLM이 2026으로 채운 적이 있음)
+KDB_CXL_CHUNK = ("CXL 메모리 시장23) 규모는 ’23년 14백만달러에서 ‘2/HxT67년 3,400백만달러까지  급성장 "
+                 "전망(/HxT’p/HxT55LE(‘23./HxTS’))")
+
+
+def test_year_must_appear_in_source():
+    assert market.year_in_source("2023", KDB_CXL_CHUNK)              # ’23년 두 자리 표기
+    assert not market.year_in_source("2026", KDB_CXL_CHUNK)          # 깨진 연도를 추측한 값
+    assert market.year_in_source("", KDB_CXL_CHUNK)
+    assert market.year_in_source("2024~2030", SUMMARY_CHUNK)
+
+
+def test_forecast_by_year_or_wording_after_value():
+    assert market.is_forecast("2030", "8,600억 달러", SUMMARY_CHUNK, this_year=2026)
+    assert not market.is_forecast("2024", "1,240억 달러", SUMMARY_CHUNK, this_year=2026)   # 같은 문장에 '전망'이 있어도 기준 연도 값
+    assert market.is_forecast("", "3,400백만달러", KDB_CXL_CHUNK, this_year=2026)          # 연도를 모르면 값 뒤 '전망'
+    assert not market.is_forecast("", "14백만달러", KDB_CXL_CHUNK, this_year=2026)
+
+
+def test_extract_blanks_unverified_year_and_fixes_summary(monkeypatch):
+    from langchain_core.documents import Document
+
+    figs = [market.MarketFigure(kind="시장규모", value="14백만달러", year="2023", scope="CXL 메모리 시장", evidence_id=0),
+            market.MarketFigure(kind="시장규모", value="3,400백만달러", year="2026", scope="CXL 메모리 시장", evidence_id=0)]
+    summary = "CXL 메모리 시장은 2023년 14백만달러에서 2026년 3,400백만달러로 급성장할 전망이다."
+
+    class FakeLLM:
+        def with_structured_output(self, _):
+            return self
+
+        def with_retry(self, **_):
+            return self
+
+        def invoke(self, _):
+            return market.MarketAnalysis(figures=figs, demand_drivers=[], market_risks=[], summary=summary, evidence_ids=[0])
+
+    monkeypatch.setattr(market, "ChatOpenAI", lambda **_: FakeLLM())
+    a, out = market.extract("엑시나", "인프라", [Document(page_content=KDB_CXL_CHUNK, metadata={})])
+    assert [(f["year"], f.get("year_note"), f["forecast"]) for f in out] == [("2023", None, False), ("", market.YEAR_UNKNOWN, True)]
+    assert "2026년" not in a.summary and "3,400백만달러(연도 미상)" in a.summary

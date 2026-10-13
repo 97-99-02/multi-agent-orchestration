@@ -226,6 +226,11 @@ def test_prompt_rules_for_consistency_and_summary_citations():
     assert "줄마다 끝에 출처 번호" in reporter.SYSTEM_PROMPT
 
 
+def test_prompt_rules_for_units_years_and_forecasts():
+    assert "다른 단위로 바꾼 값을 괄호로 덧붙이지 않습니다" in reporter.SYSTEM_PROMPT
+    assert "'연도 미상'" in reporter.SYSTEM_PROMPT and "forecast=true" in reporter.SYSTEM_PROMPT
+
+
 # ---------- 지적된 장만 재작성 (2차 피드백 C단계) ----------
 PREV_REPORT = """## SUMMARY
 **결론:** 투자.
