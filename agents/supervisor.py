@@ -10,7 +10,9 @@
 
 라우팅 규칙 (위에서부터 처음 맞는 것)
  0. supervisor 실행 횟수가 MAX_STEPS 초과 → 보고서가 없으면 reporter, 있으면 종료
- 1. 보고서가 있음 → 사실 검증 → (불일치면 재작성) → 품질 평가 → (미달이면 재작성) → 종료
+ R. 재조사 진행 중 → 재조사한 관점 반영해 judge 재판단 → 투자면 보고서 다시 작성, 보류면 다음 후보
+ 1. 보고서가 있음 → 사실 검증 → (불일치면 재작성) → 품질 평가
+    → 미달이고 근거 부족(evidence_gaps)이면 해당 관점 재조사(기업당 MAX_RESEARCH_LOOPS회), 표현 문제면 재작성 → 종료
  2. 현재 기업이 투자 결정 → reporter
  3. 아직 후보 발굴 전 → explorer
  4. 현재 기업이 조건 미충족 또는 보류 → 남은 후보가 있으면 explorer, 없으면 reporter("추천 기업 없음")
@@ -22,7 +24,7 @@ from urllib.parse import urlparse
 
 from langgraph.graph import END
 
-from config import MAX_QUALITY_LOOPS, MAX_REPORT_RETRY, MAX_REWORK, MAX_STEPS
+from config import MAX_QUALITY_LOOPS, MAX_REPORT_RETRY, MAX_RESEARCH_LOOPS, MAX_REWORK, MAX_STEPS
 from obs import log_decision
 from state import CONTROL_RESET_ON_NEXT
 
@@ -119,6 +121,45 @@ def evidence_report(state: dict) -> dict[str, dict]:
     return {node: check_evidence(node, state.get(key) or {}, sources, company) for node, key in ANALYSIS.items()}
 
 
+# 품질 평가가 근거 부족을 짚었는데 supervisor 충분성 판정은 통과했던 관점을 다시 조사할 때의 보완 대상
+RESEARCH_FOCUS = {
+    "tech_summary": ["development_stage", "performance_metrics", "public_revenue_contracts", "publisher_diversity"],
+    "market": ["upper_segment"],
+    "team": ["alternative_queries", "publisher_diversity"],
+    "competitor": ["english_keywords", "publisher_diversity"],
+}
+
+
+def _research(state: dict, gaps: dict, research: int, loops: int) -> tuple:
+    """품질 평가가 짚은 근거 부족 관점을 다시 조사하게 한다 (글을 고쳐서는 해결되지 않는 미달)."""
+    status = evidence_report(state)
+    requests = {n: {"reason": f"품질 평가: {r}",
+                    "focus": status[n]["focus"] if not status[n]["sufficient"] else RESEARCH_FOCUS[n]}
+                for n, r in gaps.items()}
+    why = "; ".join(f"{n}: {r[:60]}" for n, r in gaps.items())
+    return (list(gaps), f"품질 평가 근거 부족({why}) → 관점 재조사 {research + 1}/{MAX_RESEARCH_LOOPS}",
+            {"reopen_stage": "research", "research_loops": research + 1, "quality_loops": loops + 1,
+             "rework_request": requests})
+
+
+def _reopened(state: dict, stage: str, version: int) -> tuple:
+    """재조사 후 단계: 재조사 결과로 judge 재판단 → 투자면 보고서 다시 작성, 보류면 다음 후보."""
+    if stage == "research":
+        return ["judge"], "재조사한 관점을 반영해 다시 판단", {"reopen_stage": "judge", "rework_request": {}}
+    name = (state.get("company") or {}).get("name", "")
+    scores = state.get("scores") or {}
+    if scores.get("decision") == DECISION_INVEST:
+        return (["reporter"], f"{name} 재판단 투자({scores.get('total')}점) → 보고서 다시 작성",
+                {"reopen_stage": None, "report_version": version + 1})
+    candidates, next_idx = state.get("candidates") or [], state.get("current_index", 0) + 1
+    why = f"{name} 재판단 보류({scores.get('total')}점)"
+    if next_idx < len(candidates):
+        return (["explorer"], f"{why} → 다음 후보 {candidates[next_idx]}",
+                {"current_index": next_idx, **CONTROL_RESET_ON_NEXT})
+    return (["reporter"], f"{why}, 후보 소진 → '추천 기업 없음' 보고서",
+            {"reopen_stage": None, "report_version": version + 1})
+
+
 def _report_stage(state: dict, version: int) -> tuple:
     verify = state.get("verify_result") or {}
     if verify.get("report_version") != version:
@@ -140,6 +181,10 @@ def _report_stage(state: dict, version: int) -> tuple:
     if evaluation.get("passed"):
         return END, f"보고서 v{version} 품질 통과 → 종료", {}
     failed = [k for k, v in (evaluation.get("items") or {}).items() if not v.get("passed")]
+    gaps = {n: r for n, r in (evaluation.get("evidence_gaps") or {}).items() if n in ANALYSIS}
+    research = state.get("research_loops", 0)
+    if gaps and loops < MAX_QUALITY_LOOPS and research < MAX_RESEARCH_LOOPS:
+        return _research(state, gaps, research, loops)
     if loops < MAX_QUALITY_LOOPS:
         return (["reporter"], f"품질 미달({', '.join(failed)}) → 재작성 {loops + 1}/{MAX_QUALITY_LOOPS}",
                 {"quality_loops": loops + 1, "report_version": version + 1})
@@ -157,6 +202,10 @@ def decide(state: dict, step: int) -> tuple:
         if not report:
             return ["reporter"], f"{halt} → 지금까지 결과로 보고서 작성", {"report_version": version + 1, "last_error": halt}
         return END, f"{halt} → 종료", {"last_error": halt}
+
+    # R. 재조사 진행 중 (품질 평가가 근거 부족을 짚어 관점을 다시 조사한 경우)
+    if state.get("reopen_stage"):
+        return _reopened(state, state["reopen_stage"], version)
 
     # 1. 보고서 단계
     if report:

@@ -21,10 +21,12 @@ import json
 import logging
 import os
 import re
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from agents.reporter import REFERENCE_HEADING, printed_reference_numbers
+from agents.reporter import REFERENCE_HEADING, cited_source_map, printed_reference_numbers
+from agents.supervisor import evidence_report
 from agents.verifier import _evidence_json, check_citations, find_wording_problems
 from config import (LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MAX_QUALITY_LOOPS, MODEL_JUDGE, QUALITY_CITED_RATIO,
                     QUALITY_MAX_SAME_DAY_SHARE, QUALITY_MAX_SOURCE_SHARE, QUALITY_MAX_UNVERIFIED,
@@ -46,7 +48,13 @@ COMPETITION_HEADING = "경쟁 구도"
 PROMOTIONAL = ("반드시 투자", "강력 추천", "강력히 추천", "투자해야 한다", "놓치지 말아야", "확실한 수익", "틀림없")
 DISPARAGING = ("열등", "상대가 되지", "뒤처진 기업", "경쟁력이 없는")
 # 수치 근거 없이 회사 보도자료에서 옮긴 홍보 표현
-MARKETING = ("최적화된 성능", "최적의 성능", "혁신적인", "획기적인", "탁월한", "최고의")
+MARKETING = ("최적화된 성능", "최적의 성능", "혁신적인", "획기적인", "탁월한", "최고의", "최고 수준")
+# 보고서에 나오면 안 되는 내부 자료 이름 (영문 필드명). reporter가 한글로 바꾸고, 남으면 미달
+INTERNAL_NAMES = ("core_chips", "development_stage", "performance_metrics", "public_revenue_contracts",
+                  "tech_summary", "market_analysis", "competitor_analysis",
+                  "team_analysis", "summary_caution", "info_insufficient", "industry_context", "sub_market",
+                  "segment_specific", "sources_for_citation", "evaluation_rules")
+SUMMARY_EVIDENCE_LABEL = "**핵심 근거**"
 
 CITATION = re.compile(r"\[(\d+)\]")
 REFERENCE_LINE = re.compile(r"^- \[(\d+)\] ([^(\n]+?)\(([^)]*)\)", re.MULTILINE)
@@ -119,6 +127,20 @@ def check_groundedness(report: str, recommend: bool) -> list[str]:
         competition = [t for h, t in sections(body) if COMPETITION_HEADING in h]
         if competition and not CITATION.search(competition[0]):
             reasons.append("경쟁 구도 장에 인용 없음 (경쟁사 수치의 출처를 확인할 수 없음)")
+    if recommend:
+        # SUMMARY 핵심 근거: 수치·사실을 담은 줄마다 출처 번호 (분석 장 문단 검사에 안 걸리는 부분)
+        summary = next((t for h, t in sections(body) if "SUMMARY" in h.upper()), "")
+        if SUMMARY_EVIDENCE_LABEL in summary:
+            block = summary.split(SUMMARY_EVIDENCE_LABEL, 1)[1].split("**", 1)[0]
+            bullets = [ln for ln in block.splitlines() if ln.strip().startswith(("-", "*", "•"))]
+            uncited = [b for b in bullets if not CITATION.search(b)]
+            if uncited:
+                reasons.append(f"SUMMARY 핵심 근거 {len(bullets)}개 중 {len(uncited)}개에 출처 번호 없음")
+    exposed = [w for w in INTERNAL_NAMES if re.search(rf"(?<![A-Za-z_]){w}(?![A-Za-z_])", body)]
+    exposed += [w for w in ("weaknesses", "strengths")   # 일반 단어이기도 해서 필드명처럼 쓰인 경우만
+                if re.search(rf"(?<![A-Za-z_]){w}(?=['’\"]|\s*[가-힣])", body)]
+    if exposed:
+        reasons.append(f"내부 자료 이름 노출: {', '.join(exposed)}")
     marks = body.count(UNVERIFIED_MARK)
     if marks > QUALITY_MAX_UNVERIFIED:
         reasons.append(f"사실 검증에서 확인되지 않은 표현 {marks}곳 (허용 {QUALITY_MAX_UNVERIFIED})")
@@ -184,27 +206,43 @@ def code_checks(report: str, state: dict) -> dict[str, list[str]]:
 class JudgeItem(BaseModel):
     passed: bool
     reasons: list[str] = Field(description="미달이면 보고서의 어느 문장이 왜 문제인지 구체적으로. 통과면 빈 목록")
+    quotes: list[str] = Field(default_factory=list,
+                              description="reasons와 같은 순서로, 문제 문장을 보고서에서 글자 그대로 옮긴 것")
+
+
+class EvidenceGap(BaseModel):
+    perspective: Literal["tech_summary", "market", "competitor", "team"]
+    reason: str = Field(description="보고서를 고쳐 써서는 해결되지 않는 이유 (자료 자체에 근거가 없거나 한쪽 출처뿐)")
 
 
 class QualityJudgement(BaseModel):
     groundedness: JudgeItem = Field(description="본문 주장(특히 수치·사실)이 인용한 출처와 분석 자료로 뒷받침되는가")
     neutrality: JudgeItem = Field(description="투자/보류 결정을 기준표 점수로만 설명하고, 리스크를 축소하거나 경쟁사를 깎아내리지 않는가")
     bias_control: JudgeItem = Field(description="분석 자료에 있는 약점·리스크·반대 근거를 빼고 유리한 근거만 쓰지 않았는가")
+    evidence_gaps: list[EvidenceGap] = Field(default_factory=list,
+                                             description="미달 원인이 문장이 아니라 분석 자료의 근거 부족인 관점. 없으면 빈 목록")
 
 
 JUDGE_PROMPT = """너는 투자 평가 보고서의 품질 검토자다. 아래 [분석 자료]만 근거로 [보고서]를 3개 항목별로 판정하라.
 보고서 문장을 고치지 말고, 항목마다 통과 여부와 미달 사유만 적는다. 사유는 보고서의 해당 문장이나 장을 짚어 구체적으로 쓴다.
 투자/보류 결정은 규칙으로 정해진 것이므로 결정의 옳고 그름은 판정하지 않는다. 결정을 설명하는 방식만 본다.
 미달은 아래처럼 내용에 문제가 있을 때만 판정한다. 표현·용어 선택·문체·분량은 미달 사유가 아니다.
-- groundedness: 보고서의 사실·수치가 [분석 자료]나 인용한 출처와 다르거나, 자료에 없는 사실을 단정함
+- groundedness: 보고서의 사실·수치가 [분석 자료]나 인용한 출처와 다르거나, 자료에 없는 사실을 단정함,
+  또는 같은 사실(양산·테이프아웃 시점, 수치 등)을 장마다 다른 값·시점으로 씀,
+  또는 문장에 붙은 출처 번호의 [인용 출처 원문]이 그 문장을 뒷받침하지 않음 (다른 출처를 잘못 붙임)
 - neutrality: 점수·기준표가 아닌 근거로 결정을 정당화하거나, 리스크를 축소하거나, 경쟁사를 깎아내리거나,
   수치 근거 없는 회사 홍보 문구(보도자료 어투)를 사실처럼 옮김
 - bias_control: [분석 자료]에 있는 약점·리스크·반대 근거를 보고서에서 뺌, 또는 한 발표를 옮긴 기사들에만 기댐
 자료에 없는 내용을 없다고 밝힌 것은 미달 사유가 아니다.
+미달 원인이 보고서 문장이 아니라 [분석 자료] 자체에 근거가 없거나 한 발표·한 출처뿐인 것이면, 그 관점
+(tech_summary, market, competitor, team)과 이유를 evidence_gaps에 적는다. 다시 써서 고칠 수 있는 표현 문제는 넣지 않는다.
 {mode_note}
 
 [분석 자료 - JSON]
 {materials}
+
+[인용 출처 원문] (보고서 REFERENCE 번호별 근거 원문 일부)
+{cited}
 
 [보고서]
 {report}"""
@@ -224,10 +262,72 @@ def _judge(judge_llm):
     return ChatOpenAI(model=MODEL_JUDGE, temperature=0, seed=LLM_SEED, max_tokens=LLM_MAX_TOKENS)
 
 
+def cited_snippets(report: str, state: dict, per_source: int = 300, limit: int = 6000) -> str:
+    """REFERENCE 번호별 근거 원문 일부. Judge가 문장에 붙은 출처가 맞는지 볼 수 있게 한다."""
+    lines = []
+    for n, raws in sorted(cited_source_map(report, state).items()):
+        text = " / ".join(r.get("snippet", "") for r in raws if r.get("snippet"))
+        if text:
+            lines.append(f"[{n}] {text[:per_source]}")
+    return "\n".join(lines)[:limit] or "(근거 원문 없음)"
+
+
+def evidence_segments(state: dict) -> list[str]:
+    """Judge 판정을 다시 확인할 때 찾아볼 자료 조각: 분석 자료의 문자열 값과 현재 기업 출처의 근거 원문."""
+    segments = []
+
+    def walk(value):
+        if isinstance(value, str):
+            segments.append(value)
+        elif isinstance(value, dict):
+            for v in value.values():
+                walk(v)
+        elif isinstance(value, list):
+            for v in value:
+                walk(v)
+    walk(json.loads(_evidence_json(state)))
+    name = (state.get("company") or {}).get("name")
+    segments += [s.get("snippet", "") for s in state.get("sources") or [] if s.get("company") == name]
+    return [s for s in segments if s]
+
+
+NUMBER = re.compile(r"\d+(?:[.,]\d+)?")
+WORD = re.compile(r"[가-힣A-Za-z]{2,}")
+
+
+def supported_by_evidence(quote: str, segments: list[str]) -> bool:
+    """문장의 숫자가 모두 들어 있고, 그 조각의 단어 2개 이상이 문장에 나오는 자료 조각이 있으면 True.
+    (문장 쪽 단어에는 조사가 붙어 '레귤러스는'처럼 되므로 자료 쪽 단어가 문장 안에 있는지로 본다)
+    숫자가 없는 문장은 코드로 확인할 수 없어 False (Judge 판정을 그대로 둔다)."""
+    quote = CITATION.sub("", quote)
+    numbers = [n.replace(",", "") for n in NUMBER.findall(quote)]
+    if not numbers:
+        return False
+    for seg in segments:
+        compact = seg.replace(",", "")
+        if all(n in compact for n in numbers) and sum(1 for w in set(WORD.findall(seg)) if w in quote) >= 2:
+            return True
+    return False
+
+
+def recheck_groundedness(verdict: JudgeItem, state: dict) -> tuple[JudgeItem, int]:
+    """Judge가 '자료에 없다'고 한 문장을 자료에서 다시 찾아, 실제로 있으면 그 사유를 뺀다.
+    같은 문장을 회차마다 다르게 판정한 일이 있어 코드로 한 번 더 확인한다. (수정된 판정, 뺀 사유 수)"""
+    if verdict.passed or not verdict.quotes:
+        return verdict, 0
+    segments = evidence_segments(state)
+    keep = [(r, q) for i, r in enumerate(verdict.reasons)
+            for q in [verdict.quotes[i] if i < len(verdict.quotes) else ""]
+            if not supported_by_evidence(q, segments)]
+    dropped = len(verdict.reasons) - len(keep)
+    return JudgeItem(passed=not keep, reasons=[r for r, _ in keep], quotes=[q for _, q in keep]), dropped
+
+
 def llm_checks(report: str, state: dict, judge_llm) -> QualityJudgement:
     mode_note = ("" if is_recommend(state) else
                  "추천 기업 없음 보고서다. 편향 통제는 보류 사유를 공정하게 정리했는지로만 본다.")
-    prompt = JUDGE_PROMPT.format(mode_note=mode_note, materials=_evidence_json(state)[:15000], report=report)
+    prompt = JUDGE_PROMPT.format(mode_note=mode_note, materials=_evidence_json(state)[:15000],
+                                 cited=cited_snippets(report, state), report=report)
     chain = judge_llm.with_structured_output(QualityJudgement).with_retry(stop_after_attempt=LLM_ATTEMPTS)
     return chain.invoke(prompt)
 
@@ -246,6 +346,21 @@ def add_quality_note(report: str, items: dict) -> str:
     return head.rstrip() + "\n\n" + note + "\n\n" + sep + tail
 
 
+def evidence_gaps(code: dict, judgement, state: dict) -> dict[str, str]:
+    """다시 써서는 해결되지 않는 근거 부족 관점 {관점: 이유}. supervisor가 이 관점을 다시 조사한다.
+    코드: 편향 통제가 출처 수·같은 날 보도로 미달이면, 관점별 충분성 판정에서 같은 문제가 있는 관점.
+    Judge: evidence_gaps로 짚은 관점.
+    """
+    gaps = {}
+    if any(("발행처" in r or "같은 날" in r) for r in code["bias_control"]):
+        for node, status in evidence_report(state).items():
+            if "publisher_diversity" in status["focus"]:
+                gaps[node] = status["reason"]
+    for gap in (judgement.evidence_gaps if judgement else []):
+        gaps.setdefault(gap.perspective, gap.reason)
+    return gaps
+
+
 def fix_instructions(items: dict) -> str:
     lines = [f"- [{ITEM_LABELS[k]}] {r}" for k in ITEMS for r in items[k]["reasons"] if not items[k]["passed"]]
     return "\n".join(lines)
@@ -262,24 +377,28 @@ def quality_eval_node(state: dict, judge_llm=None) -> dict:
             judge_error = f"{type(e).__name__}: {e}"[:200]
             logger.warning("[품질 평가] LLM Judge 실패 → 코드 검사만으로 판정: %s", judge_error)
 
-    items = {}
+    items, rechecked = {}, 0
     for k in ITEMS:
         verdict = getattr(judgement, k) if judgement else None
+        if k == "groundedness" and verdict is not None:
+            verdict, rechecked = recheck_groundedness(verdict, state)
         reasons = list(code[k]) + ([f"(Judge) {r}" for r in verdict.reasons] if verdict and not verdict.passed else [])
         items[k] = {"passed": not code[k] and (verdict is None or verdict.passed), "reasons": reasons,
                     "code_passed": not code[k], "judge_passed": None if verdict is None else verdict.passed}
     passed = all(v["passed"] for v in items.values())
+    gaps = evidence_gaps(code, judgement, state) if not passed and is_recommend(state) else {}
     # 회차마다 미달 사유를 결정 로그에 남긴다 (보고서에는 마지막 회차 사유만 남으므로)
     log_event(state.get("trace_id"), "quality", "quality_eval", report_version=state.get("report_version"),
               passed=passed, failed={k: v["reasons"] for k, v in items.items() if not v["passed"]},
-              judge_ran=judgement is not None)
+              judge_ran=judgement is not None, evidence_gaps=gaps)
     logger.info("[품질 평가] v%s %s: %s", state.get("report_version"), "통과" if passed else "미달",
                 {k: v["passed"] for k, v in items.items()})
     out = {"eval_result": {
         "passed": passed, "report_version": state.get("report_version"),
         "mode": "recommend" if is_recommend(state) else "no_recommend",
         "items": items, "fix_instructions": fix_instructions(items),
-        "judge_ran": judgement is not None, "judge_error": judge_error,
+        "judge_ran": judgement is not None, "judge_error": judge_error, "evidence_gaps": gaps,
+        "judge_rechecked": rechecked,   # Judge가 '자료에 없음'이라 했지만 자료에서 찾아 뺀 사유 수
     }}
     # 재작성 한도에 도달한 미달이면 supervisor가 종료하므로, 미달 항목을 보고서 한계점에 남긴다 (verifier의 '확인 필요'와 같은 방식)
     if not passed and state.get("quality_loops", 0) >= MAX_QUALITY_LOOPS:

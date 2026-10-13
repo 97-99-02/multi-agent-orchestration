@@ -52,7 +52,8 @@ MAX_REPORT_RETRY = 1
 
 # Supervisor 종료 보장 (반복 상한)
 MAX_REWORK = 1          # 관점당 재작업 횟수 (기업 단위). 공개 정보가 없으면 다시 찾아도 없다
-MAX_QUALITY_LOOPS = 2   # 품질 평가 미달로 보고서를 다시 쓰는 횟수
+MAX_QUALITY_LOOPS = 2   # 품질 평가 미달로 보고서를 다시 쓰는 횟수 (근거 부족 재조사도 1회로 센다)
+MAX_RESEARCH_LOOPS = 1  # 품질 평가가 근거 부족을 짚었을 때 관점을 다시 조사하는 횟수 (기업 단위)
 # 보고서 품질 평가 기준 (agents/quality.py 코드 검사)
 QUALITY_CITED_RATIO = 0.8        # Groundedness: 분석 장에서 숫자가 든 문단 중 [n] 인용이 있는 비율
 QUALITY_MAX_UNVERIFIED = 2       # Groundedness: 사실 검증이 남긴 '(확인 필요)' 표시 허용 개수
