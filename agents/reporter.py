@@ -41,7 +41,7 @@ from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Space
 from reportlab.platypus.doctemplate import LayoutError
 
 from config import (ALLOWED_ROUNDS, CORE_CAUTION_SCORE, CORE_ITEMS, CORE_MIN_SCORE, INVEST_THRESHOLD,
-                    MAX_CANDIDATES, MAX_REPORT_RETRY, MODEL_ANALYZE)
+                    MAX_CANDIDATES, MODEL_ANALYZE)
 from config import WEIGHTS as TEAM_WEIGHTS
 
 logger = logging.getLogger(__name__)
@@ -140,7 +140,6 @@ FORMAT_FIX_TEMPLATE = """[형식 수정 요청] 직전 보고서가 아래 과�
 # ═════════════════════════════════════════════════════════════
 LLM_MODEL = MODEL_ANALYZE    # 팀 설정(config.py)을 따른다
 LLM_TEMPERATURE = 0.0          # 0 = 매번 거의 같은 답(재현성). 사실 기반 글이라 창의성 불필요
-MAX_RETRY = MAX_REPORT_RETRY  # 설계 문서: 사실 검증 후 재작성은 최대 1회 (config.py)
 MAX_FORMAT_FIXES = 1           # 과제 조건 위반 시 형식만 고쳐 쓰는 횟수(사실 검증 재작성과 별개)
 
 # 평가표(설계서 3장) — 바뀌면 여기만 고친다. 순서는 보고서 표의 표시 순서이기도 하다
@@ -679,13 +678,9 @@ def reporter_node(state: dict, llm=None) -> dict:
     mode = "투자 추천 보고서" if recommend else "추천 기업 없음 보고서"
     logger.info("[보고서 생성] 유형: %s", mode)
 
-    # 재작성 여부: 직전 검증이 실패로 끝났다면 재작성 → 횟수 +1
-    prev = state.get("verify_result") or {}
-    is_rewrite = bool(prev) and not prev.get("passed", True)
-    retry_count = state.get("retry_count", 0) + (1 if is_rewrite else 0)
-    if retry_count > MAX_RETRY:
-        raise ValueError(f"재작성 횟수({retry_count})가 한도({MAX_RETRY})를 넘었습니다.")
-    logger.info("[보고서 생성] 재작성 여부=%s, retry_count=%d", is_rewrite, retry_count)
+    # 재작성 횟수·한도는 supervisor가 관리한다 (제어 키). 여기서는 몇 번째 보고서인지 기록만 한다
+    logger.info("[보고서 생성] report_version=%s, 사실 검증 재작성=%s회, 품질 재작성=%s회",
+                state.get("report_version"), state.get("retry_count", 0), state.get("quality_loops", 0))
 
     sources = collect_sources(state) if recommend else []
     logger.info("[보고서 생성] 사용 가능한 출처 %d건", len(sources))
@@ -714,7 +709,7 @@ def reporter_node(state: dict, llm=None) -> dict:
         logger.warning("[보고서 생성] 형식 수정 후에도 위반이 남았습니다. 현재 본문을 유지합니다.")
 
     logger.info("[보고서 생성] 완료 (%d자)", len(report))
-    return {"report": report, "retry_count": retry_count}
+    return {"report": report}
 
 
 # ═════════════════════════════════════════════════════════════

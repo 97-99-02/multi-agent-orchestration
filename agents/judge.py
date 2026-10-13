@@ -142,8 +142,8 @@ def cite(ids: list[int], sources: list[dict]) -> list[dict]:
 
 
 def is_placeholder(analysis: dict | None) -> bool:
-    """분석 결과가 비었거나 아직 구현되지 않은 임시 값({"todo": True})인가."""
-    return not analysis or bool(analysis.get("todo"))
+    """분석 결과가 비었거나, 임시 값({"todo": True})이거나, 실행 오류로 채워지지 않았는가({"failed": True})."""
+    return not analysis or bool(analysis.get("todo") or analysis.get("failed"))
 
 
 def apply_evidence_rules(card: Scorecard, state: dict, sources: list[dict]) -> dict:

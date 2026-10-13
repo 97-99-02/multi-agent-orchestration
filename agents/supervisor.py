@@ -121,6 +121,8 @@ def _report_stage(state: dict, version: int) -> tuple:
         return ["quality_eval"], f"보고서 v{version} 품질 평가", {}
 
     loops = state.get("quality_loops", 0)
+    if evaluation.get("error"):
+        return END, f"품질 평가 오류({evaluation['error'][:60]}) → 재작성 없이 종료", {}
     if evaluation.get("passed"):
         return END, f"보고서 v{version} 품질 통과 → 종료", {}
     failed = [k for k, v in (evaluation.get("items") or {}).items() if not v.get("passed")]

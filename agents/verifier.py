@@ -860,7 +860,8 @@ def verifier_node(state: dict, judge_llm=None, retriever=None) -> dict:
                 checked, rag_info["checked"], judged, len(mismatches), "통과" if passed else "불일치")
 
     result = {"passed": passed, "mismatches": mismatches, "checked": checked, "judged": judged,
-              "judge_ran": judge is not None and "judge" not in errors, "rag": rag_info, "errors": errors}
+              "judge_ran": judge is not None and "judge" not in errors, "rag": rag_info, "errors": errors,
+              "report_version": state.get("report_version")}   # supervisor가 어느 보고서의 검증인지 확인
     update = {"verify_result": result}
 
     exhausted = not passed and state.get("retry_count", 0) >= MAX_RETRY
