@@ -71,6 +71,8 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
    **확인 필요**
    - 추가 확인이 필요한 사항 (1~2개). [분석 자료]에 summary_caution이 있으면 그 내용(항목명과 점수)을
      한 항목으로 반드시 포함합니다. (예: 기술·제품 성숙도 2점(정보 부족으로 제한) 확인 필요)
+     summary_caution이 없으면 그 항목은 쓰지 않습니다.
+   [분석 자료]의 키 이름(summary_caution, team_analysis 등)은 본문 어디에도 쓰지 않습니다.
 6. 'REFERENCE' 장은 쓰지 않습니다. (코드가 실제 사용 출처로 자동 첨부합니다.)
 7. 본문 전체는 한글 기준 약 10,000~14,000자로 씁니다. (PDF는 대시보드·REFERENCE 포함 7~10장)
    1~4장(관점 장)은 [분석 자료]에 있는 사실을 빠짐없이 2~4문단으로 자세히 씁니다. 분량을 채우려고 자료에 없는 내용이나
@@ -79,10 +81,12 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
    그 아래에 항목별 근거를 문장으로 해설합니다. (표는 코드가 자동으로 채웁니다.)
 9. 수치나 사실을 말하는 문장 끝에는 [분석 자료]의 sources_for_citation에 있는 번호를 [1]처럼 붙이세요.
    번호가 여러 개면 [1][2]처럼 하나씩 따로 씁니다. ([1,2]·[1-2]처럼 묶지 않습니다)
+   대괄호 안에는 숫자만 씁니다. [team_analysis]처럼 자료 이름을 넣지 않습니다.
    목록에 없는 번호는 절대 쓰지 말고, 근거 출처가 없으면 번호를 붙이지 않습니다.
 10. '경쟁 구도' 장에는 경쟁사 목록·차별점·경쟁 리스크를 직접 나열하지 말고, 그 자리에 {{COMPETITOR_TABLE}} 한 줄만 쓰세요.
     (구도 그림과 차별점·리스크 목록은 코드가 자동으로 채웁니다.) 그 아래에는 이 경쟁 구도가 투자 판단에
     주는 의미를 2~3문장으로 해설합니다. 목록 내용을 그대로 반복하지 않습니다.
+    해설 문장에는 sources_for_citation 중 used_by에 competitor가 있는 출처 번호를 붙입니다.
 11. 장과 장 사이에 '---' 같은 구분선을 쓰지 않습니다.
 12. 자료에 붙은 '(2026-04-24 기준)' 같은 날짜 표기는 지우지 말고 그대로 옮깁니다.
     '올해', '내년', '연내' 같은 상대 시점 표현은 쓰지 않습니다.
@@ -332,9 +336,30 @@ def build_decision_checks(scores: dict) -> list[str]:
     return lines
 
 
+# 분석 에이전트가 자기 검색 결과 목록 기준으로 붙인 번호 ([3], [2,5] 등). 보고서 REFERENCE 번호와 다르다
+AGENT_REF_PATTERN = re.compile(r"\s*\[\d{1,3}(?:\s*[,~\-]\s*\d{1,3})*\]")
+# 보고서 LLM이 출처 번호 대신 자료 이름을 쓴 경우 ([team_analysis] 등)
+KEY_CITATION_PATTERN = re.compile(r"\[[a-z][a-z_]*\]")
+# 자료 이름만 적힌 글머리표 줄 ('- summary_caution 없음' 등)
+KEY_NAME_LINE_PATTERN = re.compile(r"^[ \t]*[-*][ \t]*[a-z]+_[a-z_]*[ \t]*(?:없음)?[ \t]*\n?", re.MULTILINE)
+
+
+def strip_agent_refs(value):
+    """문자열 안의 에이전트 검색 결과 번호를 지운다 (dict·list는 안쪽까지)."""
+    if isinstance(value, str):
+        return AGENT_REF_PATTERN.sub("", value)
+    if isinstance(value, list):
+        return [strip_agent_refs(v) for v in value]
+    if isinstance(value, dict):
+        return {k: strip_agent_refs(v) for k, v in value.items()}
+    return value
+
+
 def _cell(text) -> str:
-    """표 칸에 넣을 글. 줄바꿈과 '|'는 표를 깨뜨리므로 바꾼다."""
-    return str(text if text not in (None, "") else "–").replace("|", "/").replace("\n", " ").strip()
+    """표 칸에 넣을 글. 줄바꿈과 '|'는 표를 깨뜨리므로 바꾼다. 에이전트 검색 결과 번호는 지운다
+    (그대로 두면 보고서 번호로 다시 매겨져 다른 출처를 가리키거나 '[출처 확인 필요]'가 된다)."""
+    text = strip_agent_refs(str(text)) if text not in (None, "") else ""
+    return (text or "–").replace("|", "/").replace("\n", " ").strip()
 
 
 def build_competitor_table(state: dict) -> str:
@@ -407,19 +432,10 @@ def _insert_table(body: str, placeholder: str, table: str, section: re.Pattern, 
     return body
 
 
-def insert_competitor_table(body: str, state: dict, sources: list[dict] | None = None) -> str:
+def insert_competitor_table(body: str, state: dict) -> str:
     """5장의 자리표시자를 경쟁사 표로 바꾼다. 자리표시자가 없으면 5장 제목 아래에 넣는다.
-    sources를 주면 표 아래에 경쟁사 분석 출처 번호를 붙인다 (표의 점유율·비교 수치를 REFERENCE로 추적할 수 있게)."""
-    table = build_competitor_table(state)
-    numbers = competitor_source_numbers(sources or [])
-    if table and numbers:
-        table += "\n\n경쟁사 정보 출처: " + "".join(f"[{n}]" for n in numbers)
-    return _insert_table(body, COMPETITOR_PLACEHOLDER, table, COMPETITOR_SECTION_PATTERN, "경쟁사 표")
-
-
-def competitor_source_numbers(sources: list[dict]) -> list[int]:
-    """collect_sources 결과 중 경쟁사 분석(node=competitor)이 기록한 출처 번호."""
-    return [s["n"] for s in sources if any(r.get("node") == "competitor" for r in s.get("raw", []))]
+    (경쟁사 출처 번호는 표 아래 해설 문장에 보고서 LLM이 붙인다. 번호만 나열한 줄은 사실 검증이 주장 없는 문장으로 잡았다)"""
+    return _insert_table(body, COMPETITOR_PLACEHOLDER, build_competitor_table(state), COMPETITOR_SECTION_PATTERN, "경쟁사 표")
 
 
 # ═════════════════════════════════════════════════════════════
@@ -628,13 +644,15 @@ def _is_recommend_mode(state: dict) -> bool:
 def build_materials(state: dict, sources: list[dict]) -> dict:
     """LLM에게 줄 '분석 자료' 묶음을 만든다. (자료에 없는 건 LLM이 못 쓰게 하려는 것)"""
     if _is_recommend_mode(state):
-        materials = {key: state[key] for key in ANALYSIS_KEYS}
+        # 분석 에이전트가 문장에 남긴 자기 검색 결과 번호([3] 등)는 보고서 출처 번호와 다르므로 지운다
+        materials = {key: strip_agent_refs(state[key]) for key in ANALYSIS_KEYS}
         if isinstance(materials.get("tech_summary"), dict):
             materials["tech_summary"] = {k: v for k, v in materials["tech_summary"].items()
                                         if k != "diagnostics"}
         # LLM이 [n]을 붙일 수 있도록 '번호 붙은 출처 목록'을 보여 준다(표기 원문은 코드가 관리)
         materials["sources_for_citation"] = [
-            {"n": s["n"], "type": s["label"], "title": s["title"]} for s in sources
+            {"n": s["n"], "type": s["label"], "title": s["title"],
+             "used_by": sorted({r.get("node", "") for r in s.get("raw", [])} - {""})} for s in sources
         ]
         # SUMMARY 결론에 '후보 A, B, C 중 선정'을 쓰게 하려는 것. (평가 순서·사유 표는 코드가 6장에 넣는다)
         materials["selection"] = {"candidates": state.get("candidates") or [],
@@ -687,10 +705,12 @@ def assemble_report(state: dict, body: str, sources: list[dict]) -> str:
     """AI가 쓴 본문에 코드가 만든 부분(점수표, REFERENCE)을 합쳐 완성본을 만든다."""
     body = REFERENCE_SECTION_PATTERN.sub("", body).rstrip()  # AI가 쓴 REFERENCE는 지운다(진짜는 코드가)
     body = split_grouped_citations(body)                     # [6,7] → [6][7] (번호 다시 매기기 전에)
+    body = KEY_CITATION_PATTERN.sub("", body)                 # [team_analysis] 같은 자료 이름 표기 삭제
+    body = KEY_NAME_LINE_PATTERN.sub("", body)                # '- summary_caution 없음' 같은 줄 삭제
     body = HR_PATTERN.sub("", body)                          # '---' 구분선은 PDF에 글자로 찍히므로 지운다
     if _is_recommend_mode(state):
         body = insert_score_table(body, state["scores"])
-        body = insert_competitor_table(body, state, sources)
+        body = insert_competitor_table(body, state)
         body, sources = keep_cited_sources(body, sources)   # REFERENCE에는 본문에서 인용한 출처만
     else:  # 추천 없음 보고서: 점수표·경쟁사 표 대신 2장에 후보별 결과 표(코드가 State에서 만든다)
         body = body.replace(PLACEHOLDER, "").replace(COMPETITOR_PLACEHOLDER, "")
@@ -813,9 +833,10 @@ LINE_RATIO = 1.8                               # 줄 간격 (글자 크기 배�
 PARA_GAP, BULLET_GAP = 7, 3                    # 문단·글머리표 뒤 간격(pt)
 SECTION_GAP, HEADING_GAP = 18, 8               # 장 제목 앞·뒤 간격(pt)
 # 이 장들은 쪽에 남은 공간이 PAGE_BREAK_ROOM보다 적으면 새 쪽에서 시작한다 (강제로 넘기면 앞 장의 마지막
-# 한두 줄만 있는 빈 쪽이 생겼다). REFERENCE와 본문 1장은 항상 새 쪽 (1쪽은 제목 밴드·SUMMARY·대시보드만)
+# 한두 줄만 있는 빈 쪽이 생겼다). REFERENCE도 같은 기준. 본문 1장은 항상 새 쪽 (1쪽은 제목 밴드·SUMMARY·대시보드만)
 PAGE_BREAK_BEFORE = ("경쟁 구도", "투자 판단 결과")
-PAGE_BREAK_ROOM = 0.45
+PAGE_BREAK_ROOM = 0.3
+BODY_START_ROOM = 0.6   # 본문 1장: 쪽에 남은 공간이 60%보다 적으면(=1쪽이 SUMMARY·대시보드로 찼으면) 새 쪽
 LAYOUT_SCALES = (1.0, 1.15, 1.3, 1.45, 1.6)       # MIN_PAGES에 못 미치면 간격 배율을 차례로 키워 다시 조판
 DASH_HEIGHT = 168                              # 대시보드 카드·차트 높이(pt)
 CARD_RATIO = 0.42                              # 대시보드에서 왼쪽 카드가 차지하는 폭 비율
@@ -901,8 +922,19 @@ def _gap(points: float) -> float:
     return points * _LAYOUT_SCALE
 
 
-def _styles(font: str, bold: str, size: float = BODY_SIZE) -> dict[str, ParagraphStyle]:
-    """본문 크기(size)에 맞춘 문단 스타일 묶음. 줄·문단 간격은 _LAYOUT_SCALE배."""
+def _styles(font: str, bold: str, size: float = BODY_SIZE, scaled: bool = True) -> dict[str, ParagraphStyle]:
+    """본문 크기(size)에 맞춘 문단 스타일 묶음. 줄·문단 간격은 _LAYOUT_SCALE배 (scaled=False면 배율 1)."""
+    global _LAYOUT_SCALE
+    saved = _LAYOUT_SCALE
+    if not scaled:
+        _LAYOUT_SCALE = 1.0
+    try:
+        return _build_styles(font, bold, size)
+    finally:
+        _LAYOUT_SCALE = saved
+
+
+def _build_styles(font: str, bold: str, size: float) -> dict[str, ParagraphStyle]:
     base = dict(fontName=font, alignment=TA_LEFT, textColor=_hex(INK))
     lead = size * LINE_RATIO * (1 + (_LAYOUT_SCALE - 1) / 2)   # 줄 간격은 배율의 절반만 키운다
     return {
@@ -1141,12 +1173,15 @@ def render_blocks(blocks: list[dict], font: str, bold: str, width: float, has_da
                 flow.append(Paragraph(_inline(title), normal["h1"]))
             flow += content_flowables(lines, normal, width, font)
         elif level == 2 and "SUMMARY" in upper:
-            inner = [Paragraph("SUMMARY", normal["h2"])] + content_flowables(lines, normal, width - 24, font)
+            # SUMMARY는 간격 배율을 적용하지 않는다 (반 쪽 기준을 지키고 1쪽 대시보드가 밀리지 않게)
+            fixed = _styles(font, bold, scaled=False)
+            inner = [Paragraph("SUMMARY", fixed["h2"])] + content_flowables(lines, fixed, width - 24, font)
             flow += [Spacer(1, 4), _panel(inner, width, PANEL, NAVY)]
         elif level == 2 and "REFERENCE" in upper:
             heading, gap = _heading2(title, small, width), Spacer(1, _gap(HEADING_GAP))
             heading.keepWithNext = gap.keepWithNext = True  # 제목만 쪽 끝에 홀로 남지 않게
-            flow += [PageBreak(), heading, gap]
+            # 강제로 새 쪽을 열면 한계점 뒤 검증 결과만 있는 반쪽짜리 쪽이 생겨, 공간이 부족할 때만 넘긴다
+            flow += [CondPageBreak(USABLE_PAGE_HEIGHT * PAGE_BREAK_ROOM), Spacer(1, _gap(SECTION_GAP)), heading, gap]
             flow += content_flowables(lines, small, width, font)
         elif level == 2:
             body = content_flowables(lines, normal, width, font)
@@ -1470,7 +1505,9 @@ def export_report_pdf(report: str, output_dir: Path = OUTPUT_DIR, filename: str 
         has_band = bool(header)
         rest = render_blocks(after_summary, font, bold, width, has_band)
         if rest and not isinstance(rest[0], PageBreak):
-            rest = [PageBreak()] + rest   # 1쪽은 제목 밴드·SUMMARY·대시보드만
+            # 1쪽은 제목 밴드·SUMMARY·대시보드만. 대시보드 일부가 2쪽으로 넘어가 있으면 또 넘기지 않는다
+            # (강제로 넘기면 대시보드 조각만 있는 빈 쪽이 생겼다)
+            rest = [CondPageBreak(USABLE_PAGE_HEIGHT * BODY_START_ROOM)] + rest
         return header + render_blocks(until_summary, font, bold, width, has_band) + visuals + rest
 
     ratio = measure_summary_ratio(report)  # SUMMARY가 반 페이지를 넘는지 실제 높이로 확인
