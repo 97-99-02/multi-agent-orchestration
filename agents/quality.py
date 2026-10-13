@@ -1,12 +1,263 @@
 """보고서 품질 평가 노드 (담당: 김다은)
 
-평가 항목: Groundedness, 중립성, 편향 통제, 관점 커버리지 (코드 검사 + LLM Judge)
-출력: {"eval_result": {"passed", "report_version", "items": {항목: {"passed", "reasons"}}, "fix_instructions"}}
+보고서 생성 → 사실 검증 → 품질 평가 순서다. 사실 검증(verifier)이 수치·출처 번호를 원문과 대조한다면,
+품질 평가는 보고서 전체가 과제 기준 4개 항목을 지키는지 본다. 미달이면 supervisor가 reporter로 되돌린다.
 
-[임시] 그래프 연결용 자리표시. 항상 통과로 돌려준다. 8단계에서 실제 평가로 교체한다.
+평가 방식: Hybrid
+- 코드 검사(결정적): 형식으로 판정할 수 있는 것 (인용 비율, 출처 번호, 과장·추천 표현, 발행처 수·편중, 관점 장 존재·분량)
+- LLM Judge(내용): 코드로는 못 보는 것 (출처가 문장을 실제로 뒷받침하는지, 유리한 근거만 골랐는지 등).
+  생성 모델(gpt-4.1-mini)과 다른 config.MODEL_JUDGE를 쓴다. 키가 없거나 호출이 실패하면 코드 검사만으로 판정한다
+- 항목은 코드 검사와 Judge를 모두 통과해야 통과다
+
+평가 항목
+- groundedness  주장이 검색된 출처로 추적되는가
+- neutrality    근거 없는 과장·추천·비하 없이 기준표와 점수로만 결정을 설명하는가 (투자/보류 결정 자체는 judge.decide 규칙)
+- bias_control  단일 출처·한쪽 근거에 기대지 않는가 (확증편향 방지)
+- coverage      4개 관점(기술 성숙도, 시장성, 이해관계자, 도메인 적용)을 모두 다루는가
+
+출력: {"eval_result": {"passed", "report_version", "mode", "items": {항목: {"passed", "reasons", ...}},
+                       "fix_instructions", "judge_ran"}}
 """
+import json
+import logging
+import os
+import re
+
+from pydantic import BaseModel, Field
+
+from agents.reporter import REFERENCE_HEADING, printed_reference_numbers
+from agents.verifier import _evidence_json, check_citations, find_wording_problems
+from config import (LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MODEL_JUDGE, QUALITY_CITED_RATIO,
+                    QUALITY_MAX_SOURCE_SHARE, QUALITY_MAX_UNVERIFIED, QUALITY_MIN_PUBLISHERS,
+                    QUALITY_MIN_SECTION_CHARS)
+
+logger = logging.getLogger(__name__)
+
+USE_LLM_JUDGE = True
+ITEMS = ("groundedness", "neutrality", "bias_control", "coverage")
+ITEM_LABELS = {"groundedness": "Groundedness", "neutrality": "중립성", "bias_control": "편향 통제",
+               "coverage": "관점 커버리지"}
+
+# 과제의 4개 관점 → 보고서 장 제목에 들어가야 하는 말 (reporter 목차와 맞춘다)
+PERSPECTIVES = ("기술 성숙도", "시장성", "이해관계자", "도메인 적용")
+RISK_HEADING = "리스크"
+
+# 중립성: 기준표·점수 밖의 추천 문구와 경쟁사 비하 (과장 표현은 verifier.OVERCLAIM_WORDS를 같이 쓴다)
+PROMOTIONAL = ("반드시 투자", "강력 추천", "강력히 추천", "투자해야 한다", "놓치지 말아야", "확실한 수익", "틀림없")
+DISPARAGING = ("열등", "상대가 되지", "뒤처진 기업", "경쟁력이 없는")
+
+CITATION = re.compile(r"\[(\d+)\]")
+REFERENCE_LINE = re.compile(r"^- \[(\d+)\] ([^(\n]+?)\(", re.MULTILINE)
+UNVERIFIED_MARK = "(확인 필요)"
 
 
-def quality_eval_node(state: dict) -> dict:
-    return {"eval_result": {"passed": True, "report_version": state.get("report_version"),
-                            "items": {}, "fix_instructions": "", "placeholder": True}}
+# ---------- 보고서 읽기 ----------
+def split_report(report: str) -> tuple[str, str]:
+    body, _, reference = report.partition(REFERENCE_HEADING)
+    return body, reference
+
+
+def sections(body: str) -> list[tuple[str, str]]:
+    """'## 제목' 단위로 나눈다. (제목, 본문) 목록."""
+    out, title, lines = [], "", []
+    for line in body.splitlines():
+        if line.startswith("## "):
+            if title:
+                out.append((title, "\n".join(lines)))
+            title, lines = line[3:].strip(), []
+        else:
+            lines.append(line)
+    if title:
+        out.append((title, "\n".join(lines)))
+    return out
+
+
+def paragraphs(text: str) -> list[str]:
+    """표·소제목을 뺀 문단."""
+    blocks = [b.strip() for b in re.split(r"\n\s*\n", text)]
+    return [b for b in blocks if b and not b.startswith(("|", "#", "{{"))]
+
+
+def prose(text: str) -> str:
+    return "\n".join(paragraphs(text))
+
+
+def references(report: str) -> dict[int, dict]:
+    """REFERENCE의 [n] → {"publisher", "kind"}. kind는 바로 위 '### 기관 보고서'/'### 웹페이지'로 정한다."""
+    _, reference = split_report(report)
+    refs, kind = {}, ""
+    for line in reference.splitlines():
+        if line.startswith("### "):
+            kind = "report" if "보고서" in line else "web"
+        m = REFERENCE_LINE.match(line)
+        if m:
+            refs[int(m.group(1))] = {"publisher": m.group(2).strip(), "kind": kind}
+    return refs
+
+
+def is_recommend(state: dict) -> bool:
+    return (state.get("scores") or {}).get("decision") == "투자"
+
+
+# ---------- 코드 검사 ----------
+def check_groundedness(report: str, recommend: bool) -> list[str]:
+    body, _ = split_report(report)
+    reasons = [f"REFERENCE에 없는 출처 번호 {p['value']}" for p in check_citations(report)]
+    if recommend:
+        analysis = [t for h, t in sections(body) if any(k in h for k in (*PERSPECTIVES, RISK_HEADING, "경쟁"))]
+        numeric = [p for t in analysis for p in paragraphs(t) if re.search(r"\d", CITATION.sub("", p))]
+        if numeric:
+            cited = sum(1 for p in numeric if CITATION.search(p))
+            if cited / len(numeric) < QUALITY_CITED_RATIO:
+                reasons.append(f"분석 장에서 수치가 든 문단 {len(numeric)}개 중 인용이 있는 문단 {cited}개 "
+                               f"({cited / len(numeric):.0%} < {QUALITY_CITED_RATIO:.0%})")
+    marks = body.count(UNVERIFIED_MARK)
+    if marks > QUALITY_MAX_UNVERIFIED:
+        reasons.append(f"사실 검증에서 확인되지 않은 표현 {marks}곳 (허용 {QUALITY_MAX_UNVERIFIED})")
+    return reasons
+
+
+def check_neutrality(report: str, state: dict) -> list[str]:
+    body, _ = split_report(report)
+    reasons = [f"자료에 없는 과장 표현 '{p['value']}'" for p in find_wording_problems(report, state)
+               if p["kind"] == "overclaim"]
+    reasons += [f"기준표 밖 추천 표현 '{w}'" for w in PROMOTIONAL if w in body]
+    reasons += [f"경쟁사 비하 표현 '{w}'" for w in DISPARAGING if w in body]
+    risk = [t for h, t in sections(body) if RISK_HEADING in h]
+    if not risk or len(prose(risk[0])) < 100:
+        reasons.append("리스크 장이 없거나 100자 미만 (리스크 축소)")
+    return reasons
+
+
+def check_bias(report: str, recommend: bool) -> list[str]:
+    body, _ = split_report(report)
+    refs = references(report)
+    cites = [int(n) for n in CITATION.findall(body) if int(n) in refs]
+    if not recommend:
+        return []   # 추천 기업 없음 보고서는 보류 사유 정리라 출처 다양성을 따지지 않는다
+    reasons = []
+    publishers = {refs[n]["publisher"] for n in set(cites)}
+    if len(publishers) < QUALITY_MIN_PUBLISHERS:
+        reasons.append(f"인용된 출처의 발행처 {len(publishers)}곳 (최소 {QUALITY_MIN_PUBLISHERS})")
+    if cites:
+        top = max(set(cites), key=cites.count)
+        share = cites.count(top) / len(cites)
+        if share > QUALITY_MAX_SOURCE_SHARE:
+            reasons.append(f"출처 [{top}]이 인용의 {share:.0%} (상한 {QUALITY_MAX_SOURCE_SHARE:.0%})")
+    kinds = {refs[n]["kind"] for n in set(cites)}
+    if kinds and not {"report", "web"} <= kinds:
+        reasons.append("기관 보고서와 웹 출처 중 한쪽만 인용")
+    risk = [t for h, t in sections(body) if RISK_HEADING in h]
+    if risk and not CITATION.search(risk[0]):
+        reasons.append("리스크 장에 인용 없음 (불리한 근거 누락 여부 확인 불가)")
+    return reasons
+
+
+def check_coverage(report: str, recommend: bool) -> list[str]:
+    if not recommend:
+        return []   # 추천 기업이 없으면 기업 단위 4개 관점 평가 대상이 아니다
+    body, _ = split_report(report)
+    secs = sections(body)
+    reasons = []
+    for view in PERSPECTIVES:
+        found = [t for h, t in secs if view in h]
+        if not found:
+            reasons.append(f"'{view}' 관점 장 없음")
+            continue
+        text = prose(found[0])
+        if len(text) < QUALITY_MIN_SECTION_CHARS:
+            reasons.append(f"'{view}' 장 {len(text)}자 (최소 {QUALITY_MIN_SECTION_CHARS})")
+        if not CITATION.search(found[0]):
+            reasons.append(f"'{view}' 장에 인용 없음")
+    return reasons
+
+
+def code_checks(report: str, state: dict) -> dict[str, list[str]]:
+    recommend = is_recommend(state)
+    return {
+        "groundedness": check_groundedness(report, recommend),
+        "neutrality": check_neutrality(report, state),
+        "bias_control": check_bias(report, recommend),
+        "coverage": check_coverage(report, recommend),
+    }
+
+
+# ---------- LLM Judge ----------
+class JudgeItem(BaseModel):
+    passed: bool
+    reasons: list[str] = Field(description="미달이면 보고서의 어느 문장이 왜 문제인지 구체적으로. 통과면 빈 목록")
+
+
+class QualityJudgement(BaseModel):
+    groundedness: JudgeItem = Field(description="본문 주장(특히 수치·사실)이 인용한 출처와 분석 자료로 뒷받침되는가")
+    neutrality: JudgeItem = Field(description="투자/보류 결정을 기준표 점수로만 설명하고, 리스크를 축소하거나 경쟁사를 깎아내리지 않는가")
+    bias_control: JudgeItem = Field(description="분석 자료에 있는 약점·리스크·반대 근거를 빼고 유리한 근거만 쓰지 않았는가")
+    coverage: JudgeItem = Field(description="기술 성숙도·시장성·이해관계자·도메인 적용 장이 각각 채점 기준(개발 단계·성능, 시장 규모·성장률, 팀·투자사·경쟁사, 고객·PoC·공급 실적)을 실제로 다루는가")
+
+
+JUDGE_PROMPT = """너는 투자 평가 보고서의 품질 검토자다. 아래 [분석 자료]만 근거로 [보고서]를 4개 항목별로 판정하라.
+보고서 문장을 고치지 말고, 항목마다 통과 여부와 미달 사유만 적는다. 사유는 보고서의 해당 문장이나 장을 짚어 구체적으로 쓴다.
+투자/보류 결정은 규칙으로 정해진 것이므로 결정의 옳고 그름은 판정하지 않는다. 결정을 설명하는 방식만 본다.
+{mode_note}
+
+[분석 자료 - JSON]
+{materials}
+
+[보고서]
+{report}"""
+
+
+def _judge(judge_llm):
+    """False=끄기, 객체=그것 사용, None=자동(키가 있으면 실제 LLM, 없으면 건너뜀). verifier와 같은 방식."""
+    if judge_llm is False or not USE_LLM_JUDGE:
+        return None
+    if judge_llm is not None:
+        return judge_llm
+    if not os.environ.get("OPENAI_API_KEY"):
+        logger.info("[품질 평가] OPENAI_API_KEY가 없어 LLM Judge를 건너뜁니다.")
+        return None
+    from langchain_openai import ChatOpenAI  # 필요할 때만 import
+
+    return ChatOpenAI(model=MODEL_JUDGE, temperature=0, seed=LLM_SEED, max_tokens=LLM_MAX_TOKENS)
+
+
+def llm_checks(report: str, state: dict, judge_llm) -> QualityJudgement:
+    mode_note = ("" if is_recommend(state) else
+                 "추천 기업 없음 보고서다. 관점 커버리지와 편향 통제는 보류 사유를 공정하게 정리했는지로만 본다.")
+    prompt = JUDGE_PROMPT.format(mode_note=mode_note, materials=_evidence_json(state)[:15000], report=report)
+    chain = judge_llm.with_structured_output(QualityJudgement).with_retry(stop_after_attempt=LLM_ATTEMPTS)
+    return chain.invoke(prompt)
+
+
+# ---------- 노드 ----------
+def fix_instructions(items: dict) -> str:
+    lines = [f"- [{ITEM_LABELS[k]}] {r}" for k in ITEMS for r in items[k]["reasons"] if not items[k]["passed"]]
+    return "\n".join(lines)
+
+
+def quality_eval_node(state: dict, judge_llm=None) -> dict:
+    report = state.get("report") or ""
+    code = code_checks(report, state)
+    judge, judgement, judge_error = _judge(judge_llm), None, ""
+    if judge is not None:
+        try:
+            judgement = llm_checks(report, state, judge)
+        except Exception as e:  # noqa: BLE001 - Judge 실패는 코드 검사만으로 판정하고 기록한다
+            judge_error = f"{type(e).__name__}: {e}"[:200]
+            logger.warning("[품질 평가] LLM Judge 실패 → 코드 검사만으로 판정: %s", judge_error)
+
+    items = {}
+    for k in ITEMS:
+        verdict = getattr(judgement, k) if judgement else None
+        reasons = list(code[k]) + ([f"(Judge) {r}" for r in verdict.reasons] if verdict and not verdict.passed else [])
+        items[k] = {"passed": not code[k] and (verdict is None or verdict.passed), "reasons": reasons,
+                    "code_passed": not code[k], "judge_passed": None if verdict is None else verdict.passed}
+    passed = all(v["passed"] for v in items.values())
+    logger.info("[품질 평가] v%s %s: %s", state.get("report_version"), "통과" if passed else "미달",
+                {k: v["passed"] for k, v in items.items()})
+    return {"eval_result": {
+        "passed": passed, "report_version": state.get("report_version"),
+        "mode": "recommend" if is_recommend(state) else "no_recommend",
+        "items": items, "fix_instructions": fix_instructions(items),
+        "judge_ran": judgement is not None, "judge_error": judge_error,
+    }}
