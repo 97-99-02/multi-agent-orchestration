@@ -152,6 +152,18 @@ def check_groundedness(report: str, recommend: bool) -> list[str]:
     return reasons
 
 
+# 'HBF(High Bandwidth Fabric)'처럼 약어 뒤 괄호에 영문 풀이를 붙인 표기
+ACRONYM = re.compile(r"\b([A-Z]{2,6})\s*\(\s*([A-Z][A-Za-z\-]+(?:\s+[A-Za-z\-]+){1,5})\s*\)")
+
+
+def check_acronyms(report: str, state: dict) -> list[str]:
+    """약어 풀이가 분석 자료·출처 원문에 없으면 미달. 왜: 자료에 없는 'HBF(High Bandwidth Fabric)'를 LLM이 지어 썼다."""
+    body, _ = split_report(report)
+    evidence = (_evidence_json(state) + " " + " ".join(str(s.get("snippet", "")) for s in state.get("sources") or [])).lower()
+    return [f"자료에 없는 약어 풀이 '{m.group(0)}'" for m in ACRONYM.finditer(body)
+            if " ".join(m.group(2).split()).lower() not in " ".join(evidence.split())]
+
+
 def check_score_statements(report: str, state: dict) -> list[str]:
     """본문이 '정보 부족으로 점수가 제한되었다'고 쓰는데 정보 부족으로 채점된 항목이 없으면 채점 결과와 모순이다."""
     body, _ = split_report(report)
@@ -211,7 +223,8 @@ def check_bias(report: str, recommend: bool) -> list[str]:
 def code_checks(report: str, state: dict) -> dict[str, list[str]]:
     recommend = is_recommend(state)
     return {
-        "groundedness": check_groundedness(report, recommend) + check_score_statements(report, state),
+        "groundedness": (check_groundedness(report, recommend) + check_score_statements(report, state)
+                         + check_acronyms(report, state)),
         "neutrality": check_neutrality(report, state),
         "bias_control": check_bias(report, recommend),
     }

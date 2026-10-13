@@ -289,3 +289,14 @@ def test_insufficient_score_statement_must_match_scores():
 def test_judge_checks_company_statements_and_stronger_conclusions():
     assert "회사(대표 인터뷰·보도자료)가 한 말을 '평가된다'" in q.JUDGE_PROMPT
     assert "원문보다 강한 결론" in q.JUDGE_PROMPT and "리스크 문장 포함" in q.JUDGE_PROMPT
+
+
+def test_acronym_expansion_must_be_in_materials():
+    # 지수 실행: 자료에 없는 'HBF(High Bandwidth Fabric)'를 LLM이 지어 썼다
+    market = section("2. 시장성", "[2][4]", "HBF(High Bandwidth Fabric) 시장은 2030년 120억 달러 규모")
+    state = {**INVEST, "market_analysis": {"figures": [{"scope": "HBF 시장", "value": "120억 달러"}]}}
+    reasons = node(make_report(market=market), state)["items"]["groundedness"]["reasons"]
+    assert "자료에 없는 약어 풀이 'HBF(High Bandwidth Fabric)'" in reasons
+    sourced = {**state, "sources": [{"company": "A사", "snippet": "HBF(High Bandwidth Flash)는 낸드 기반"}]}
+    market = section("2. 시장성", "[2][4]", "HBF(High Bandwidth Flash) 시장은 2030년 120억 달러 규모")
+    assert not any("약어" in r for r in node(make_report(market=market), sourced)["items"]["groundedness"]["reasons"])

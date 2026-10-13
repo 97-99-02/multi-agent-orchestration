@@ -72,8 +72,8 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
    **핵심 리스크**
    - 리스크 (정확히 3개, 줄마다 끝에 그 리스크를 다룬 출처 번호)
    **확인 필요**
-   - 추가 확인이 필요한 사항 (1~2개). [분석 자료]에 summary_caution이 있으면 그 내용(항목명과 점수)을
-     한 항목으로 반드시 포함합니다. (예: 기술·제품 성숙도 2점(정보 부족으로 제한) 확인 필요)
+   - 추가 확인이 필요한 사항 (1~2개). 점수를 다시 쓰는 것이 아니라 무엇을 확인해야 하는지 씁니다.
+     [분석 자료]에 summary_caution이 있으면 그 내용(항목명, 점수, 확인할 다음 점수 조건)을 한 항목으로 반드시 포함합니다.
      summary_caution이 없으면 그 항목은 쓰지 않습니다.
    [분석 자료]의 키 이름(summary_caution, team_analysis 등)은 본문 어디에도 쓰지 않습니다.
 6. 'REFERENCE' 장은 쓰지 않습니다. (코드가 실제 사용 출처로 자동 첨부합니다.)
@@ -119,6 +119,17 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
 20. [분석 자료]에 halted가 있으면 평가가 중간에 멈춘 것이므로 '한계점' 장 첫 문장에 그 사유를 그대로 씁니다.
 21. 같은 사실(양산·테이프아웃 시점, 성능·투자 수치 등)은 모든 장에서 같은 값·시점으로 씁니다.
     자료에 시점이 여러 개면 가장 최근 자료의 내용을 쓰고, 계획·목표는 '목표'라고 밝힙니다.
+    제조·양산·테이프아웃·실증은 자료에 완료로 확인된 경우에만 완료형이나 현재형('~로 제조되며')으로 씁니다.
+    확인되지 않았으면 '~로 설계 중', '~ 계획'으로 쓰고, MOU·협약 체결을 실증 완료로 쓰지 않습니다.
+22. '경쟁 구도' 장은 표 자리 아래에 '**확인된 사실**', '**비교 결과**', '**투자 관점 해석**' 소제목 줄로 세 부분을 나눠 씁니다.
+    - 확인된 사실: competitor_analysis의 claims·differentiation에 있는 수치·사실만 출처 번호와 함께 씁니다.
+      speaker가 대상 기업·경쟁사면 '~가 발표했다'처럼 발표 주체를 밝힙니다.
+    - 비교 결과: comparable=true인 수치만 우열을 씁니다. 같은 조건의 비교 자료가 없으면 '같은 조건의 비교 자료가 없어
+      우열을 판단할 수 없다'고 쓰고 not_comparable 항목을 씁니다.
+    - 투자 관점 해석: scores의 경쟁 우위 점수와 근거(기준표 상한 포함)에 맞춰 1~2문장으로 씁니다. 경쟁사 분석 결과를
+      긍정적인 투자 의견으로 바꾸지 않고, 경쟁사가 앞선 점도 함께 씁니다.
+    자료에 없는 평가('충분히 경쟁할 수 있다', '가장 위협적', '최초가 될 가능성')를 덧붙이지 않습니다.
+23. 약어(HBM, CXL 등)는 [분석 자료]에 풀어 쓴 표기가 있을 때만 풀어 쓰고, 없으면 약어 그대로 씁니다.
 """
 
 # 투자 추천 기업이 있을 때의 목차
@@ -127,7 +138,7 @@ TOC_RECOMMEND = """## SUMMARY (위 5번 틀 그대로)
 ## 2. 시장성 (세부 분야 시장 규모·성장률, 수요 요인)
 ## 3. 이해관계자 (창업자·핵심 인력, 투자사·투자 조건)
 ## 4. 도메인 적용 (고객·PoC·공급 계약 등 실적, 적용 분야)
-## 5. 경쟁 구도 (자리 {{COMPETITOR_TABLE}} + 경쟁 구도가 투자 판단에 주는 의미 2~3문장)
+## 5. 경쟁 구도 (자리 {{COMPETITOR_TABLE}} + 위 22번의 세 부분: 확인된 사실 / 비교 결과 / 투자 관점 해석)
 ## 6. 투자 판단 결과 (점수표 자리 {{SCORE_TABLE}} + 항목별 근거 해설)
 ## 7. 사업 리스크 (시장·기술·규제·경쟁, 리스크마다 출처 번호)
 ## 8. 한계점 ('정보 부족' 항목, '확인 필요' 수치, 보류·제외 기업과 사유)"""
@@ -335,10 +346,17 @@ def cautions_of(scores: dict) -> list[dict]:
 
 
 def caution_summary_hint(scores: dict) -> str:
-    """SUMMARY '확인 필요'에 쓸 주의 문구(항목명·점수·이유만, 짧게). 주의가 없으면 빈 문자열."""
-    return ", ".join(
-        f"{c.get('label', c.get('item', ''))} {c.get('score', '')}점" + ("(정보 부족으로 제한)" if c.get("insufficient") else "")
-        for c in cautions_of(scores))
+    """SUMMARY '확인 필요'에 쓸 주의 문구: 항목명·점수와 확인할 다음 점수 조건. 주의가 없으면 빈 문자열.
+    왜: '기술·제품 성숙도 2점 확인 필요'처럼 점수만 되풀이해 무엇을 확인할지 알 수 없었다."""
+    levels = rubric_levels()
+    hints = []
+    for c in cautions_of(scores):
+        label, score = c.get("label", c.get("item", "")), c.get("score", 0)
+        nxt = levels.get(c.get("item", ""), [])[score] if isinstance(score, int) and 0 < score < 5 else ""
+        reason = "정보 부족으로 제한" if c.get("insufficient") else "낮은 평가"
+        hints.append(f"{label} {score}점({reason}): {score + 1}점 조건인 '{nxt}' 충족 여부 확인 필요" if nxt
+                     else f"{label} {score}점({reason}) 근거 확인 필요")
+    return ", ".join(hints)
 
 
 def build_decision_checks(scores: dict) -> list[str]:
@@ -746,6 +764,9 @@ def _summary_structure_violations(summary: str) -> list[str]:
     return problems
 
 
+COMPETITION_PARTS = ("**확인된 사실**", "**비교 결과**", "**투자 관점 해석**")   # 5장 세 부분 (규칙 22)
+
+
 def check_format(report: str, structured_summary: bool = False,
                  summary_names: list[str] | tuple = (), summary_cautions: list[str] | tuple = ()) -> list[str]:
     """과제 조건 위반 목록을 돌려준다. 비어 있으면 모두 통과.
@@ -782,6 +803,12 @@ def check_format(report: str, structured_summary: bool = False,
 
     if "REFERENCE" not in last_title.upper():
         violations.append(f"맨 뒤 장이 REFERENCE가 아닙니다(현재: '{last_title}').")
+    if structured_summary:   # 투자 추천 보고서: 경쟁 구도 장을 사실·비교·해석으로 나눴는지
+        competition = next((body for title, body in sections if "경쟁 구도" in title), None)
+        missing = [p.strip("*") for p in COMPETITION_PARTS if competition is not None and p not in competition]
+        if missing:
+            violations.append(f"'경쟁 구도' 장에 소제목이 빠졌습니다: {', '.join(missing)}. "
+                              f"확인된 사실 / 비교 결과 / 투자 관점 해석으로 나눠 쓰세요.")
 
     limit = PAGE_CHARS * MAX_PAGES
     if len(report) > limit:

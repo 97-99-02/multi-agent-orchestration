@@ -260,6 +260,34 @@ def test_prompt_rules_for_consistency_and_summary_citations():
     assert "줄마다 끝에 출처 번호" in reporter.SYSTEM_PROMPT
 
 
+def test_summary_caution_says_what_to_check():
+    # '기술·제품 성숙도 2점 확인 필요'처럼 점수만 되풀이하지 않고 다음 점수 조건을 확인할 일로 쓴다
+    scores = {"cautions": [{"item": "tech", "label": "기술·제품 성숙도", "score": 2, "insufficient": False,
+                            "comment": "기술·제품 성숙도 2점"}]}
+    hint = reporter.caution_summary_hint(scores)
+    assert hint == f"기술·제품 성숙도 2점(낮은 평가): 3점 조건인 '{LEVELS['tech'][2]}' 충족 여부 확인 필요"
+
+
+COMPETITION_OK = ("## 5. 경쟁 구도\n**확인된 사실**\n- 사실[1]\n**비교 결과**\n같은 조건의 비교 자료가 없어 우열을 판단할 수 없다.\n"
+                  "**투자 관점 해석**\n경쟁 우위 2점.\n")
+
+
+def test_format_check_requires_three_parts_in_competition_chapter():
+    head = "## SUMMARY\n요약.\n"
+    tail = "## REFERENCE\n- [1] 출처\n"
+    missing = reporter.check_format(head + "## 5. 경쟁 구도\n해설.\n" + tail, structured_summary=True)
+    assert any("확인된 사실, 비교 결과, 투자 관점 해석" in v for v in missing)
+    ok = reporter.check_format(head + COMPETITION_OK + tail, structured_summary=True)
+    assert not any("경쟁 구도" in v for v in ok)
+
+
+def test_prompt_rules_for_tense_competition_parts_and_acronyms():
+    assert "MOU·협약 체결을 실증 완료로 쓰지 않습니다" in reporter.SYSTEM_PROMPT
+    assert "'**확인된 사실**', '**비교 결과**', '**투자 관점 해석**'" in reporter.SYSTEM_PROMPT
+    assert "comparable=true인 수치만 우열을 씁니다" in reporter.SYSTEM_PROMPT
+    assert "풀어 쓴 표기가 있을 때만 풀어 쓰고" in reporter.SYSTEM_PROMPT
+
+
 def test_prompt_rules_for_summary_risk_citations():
     assert "정확히 3개, 줄마다 끝에 그 리스크를 다룬 출처 번호" in reporter.SYSTEM_PROMPT
     assert "리스크를 다루지 않는 출처 번호를 붙이지 않습니다" in reporter.SYSTEM_PROMPT
