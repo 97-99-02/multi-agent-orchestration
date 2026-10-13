@@ -148,26 +148,70 @@ def test_short_report_is_typeset_with_larger_spacing(tmp_path, monkeypatch):
     assert reporter._LAYOUT_SCALE == 1.0          # 조판이 끝나면 배율을 되돌린다
 
 
-def test_body_starts_on_new_page_after_summary(tmp_path):
-    # SUMMARY와 본문 1장이 같은 쪽에 붙지 않는다 (1쪽은 제목·SUMMARY·대시보드만)
-    report = "## SUMMARY\n요약.\n## 1. 사업 아이디어·기술 성숙도\n짧은 본문[1].\n## REFERENCE\n### 웹페이지\n- [1] 매체(2026). 기사.\n"
-    _, pages = reporter.export_report_pdf(report, output_dir=tmp_path, filename="p.pdf")
-    assert pages >= 3                             # SUMMARY 쪽, 본문 쪽, REFERENCE 쪽
+def test_body_starts_on_new_page_only_when_first_page_is_full(tmp_path):
+    ref = "## REFERENCE\n### 웹페이지\n- [1] 매체(2026). 기사.\n"
+    body = "## 1. 사업 아이디어·기술 성숙도\n짧은 본문[1].\n"
+    full_summary = "## SUMMARY\n" + "".join(f"- 근거 문장 {i}번은 자료에 있는 사실이다.\n" for i in range(22))
+    _, pages = reporter.export_report_pdf(full_summary + body + ref, output_dir=tmp_path, filename="full.pdf")
+    _, short_pages = reporter.export_report_pdf("## SUMMARY\n요약.\n" + body + ref, output_dir=tmp_path,
+                                                filename="short.pdf")
+    assert pages > short_pages        # 1쪽이 SUMMARY로 차면 본문은 새 쪽, 짧으면 이어서 (빈 쪽을 만들지 않음)
 
 
-def test_competitor_table_gets_source_numbers_and_keeps_them_in_reference():
+def test_agent_result_numbers_are_removed_from_table_and_materials():
+    # 경쟁사 에이전트가 문장에 남긴 자기 검색 결과 번호가 보고서 출처 번호로 오인되지 않게 지운다
     state = {"competitor_analysis": {"competitors": [{"name": "Qualcomm", "tier": "선도 기업", "country": "미국",
-                                                      "product": "Hexagon", "comparison": "점유율 15.6%"}],
-                                     "differentiation": [], "competitive_risks": []},
-             "company": {"name": "A사"}}
-    sources = [{"n": 1, "label": "웹페이지", "title": "팀 기사", "raw": [{"node": "team"}]},
-               {"n": 2, "label": "웹페이지", "title": "경쟁 기사", "raw": [{"node": "competitor"}]}]
-    body = reporter.insert_competitor_table("## 5. 경쟁 구도\n{{COMPETITOR_TABLE}}\n해설[1].\n", state, sources)
-    assert "경쟁사 정보 출처: [2]" in body
-    _, cited = reporter.keep_cited_sources(body, sources)
-    assert "경쟁 기사" in [s["title"] for s in cited]          # 경쟁사 출처가 REFERENCE에 남는다
+                                                      "product": "Hexagon", "comparison": "점유율 15.6%[3]"}],
+                                     "differentiation": ["2026년 하반기 양산 계획 [19]"], "competitive_risks": []},
+             "company": {"name": "A사"}, "scores": {"decision": "투자"}}
+    table = reporter.build_competitor_table(state)
+    assert "점유율 15.6%" in table and "[3]" not in table and "[19]" not in table
+    materials = reporter.build_materials({**state, **{k: {} for k in ("tech_summary", "market_analysis", "team_analysis")},
+                                          "candidates": ["A사"]}, [])
+    assert materials["competitor_analysis"]["competitors"][0]["comparison"] == "점유율 15.6%"
+
+
+def test_competitor_table_has_no_bare_source_line_and_sources_show_their_agent():
+    state = {"competitor_analysis": {"competitors": [], "differentiation": [], "competitive_risks": []}}
+    body = reporter.insert_competitor_table("## 5. 경쟁 구도\n{{COMPETITOR_TABLE}}\n해설[2].\n", state)
+    assert "경쟁사 정보 출처" not in body
+    sources = [{"n": 2, "label": "웹페이지", "title": "경쟁 기사", "raw": [{"node": "competitor"}, {"node": "team"}]}]
+    full = {**state, "company": {"name": "A사"}, "scores": {"decision": "투자"}, "candidates": ["A사"],
+            **{k: {} for k in ("tech_summary", "market_analysis", "team_analysis")}}
+    assert reporter.build_materials(full, sources)["sources_for_citation"][0]["used_by"] == ["competitor", "team"]
+
+
+def test_key_name_citations_are_removed():
+    assert reporter.KEY_CITATION_PATTERN.sub("", "정보는 확인되지 않는다[team_analysis].") == "정보는 확인되지 않는다."
+    assert reporter.KEY_CITATION_PATTERN.sub("", "근거[3].") == "근거[3]."
 
 
 def test_prompt_rules_for_rounded_amounts_and_marketing_words():
     assert "'수십억 달러'" in reporter.SYSTEM_PROMPT and "어림 표현" in reporter.SYSTEM_PROMPT
     assert "홍보 표현" in reporter.SYSTEM_PROMPT
+    assert "대괄호 안에는 숫자만" in reporter.SYSTEM_PROMPT
+    assert "used_by에 competitor" in reporter.SYSTEM_PROMPT
+
+
+
+def test_competitor_agent_strips_result_numbers():
+    from agents import competitor
+    analysis = {"competitors": [{"name": "Hailo", "comparison": "TOPS 우위[2, 5]"}],
+                "differentiation": ["특허 12건 [4]"], "competitive_risks": ["가격 경쟁[1]"]}
+    out = competitor._strip_refs(analysis)
+    assert out["competitors"][0]["comparison"] == "TOPS 우위"
+    assert out["differentiation"] == ["특허 12건"] and out["competitive_risks"] == ["가격 경쟁"]
+
+
+
+def test_key_name_only_bullets_are_removed():
+    body = "**확인 필요**\n- 팀 역량 확인 필요\n- summary_caution 없음\n## 1. 장\n"
+    assert reporter.KEY_NAME_LINE_PATTERN.sub("", body) == "**확인 필요**\n- 팀 역량 확인 필요\n## 1. 장\n"
+
+
+def test_summary_is_not_scaled_and_body_follows_dashboard_overflow(tmp_path, monkeypatch):
+    # 간격 배율이 커도 SUMMARY 스타일은 배율 1, 다른 스타일은 배율 적용
+    monkeypatch.setattr(reporter, "_LAYOUT_SCALE", 1.45)
+    font, bold = reporter.register_korean_font()
+    assert reporter._styles(font, bold, scaled=False)["body"].leading < reporter._styles(font, bold)["body"].leading
+    assert reporter._LAYOUT_SCALE == 1.45

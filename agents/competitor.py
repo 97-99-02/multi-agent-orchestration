@@ -7,6 +7,7 @@ LLM: config.MODEL_ANALYZE
   - competitor_analysis: 같은 세부 분야 경쟁사 목록, 차별점, 경쟁 리스크
     경쟁사마다 tier를 붙인다: "선도 기업"(대기업·상장사, 시장 진입 위협) / "동급 기업"(비상장 스타트업, 상대적 위치 비교)
 """
+import re
 from typing import Literal
 
 from langchain_openai import ChatOpenAI
@@ -80,7 +81,8 @@ PROMPT = """너는 AI 반도체 투자 심사역이다. '{name}'({segment}, 주�
 시장을 주도하는 대기업·상장사(진입 위협)와 비슷한 단계의 비상장 스타트업(상대적 위치)을 모두 찾아라.
 아래 검색 결과에 근거한 내용만 쓰고, 근거로 쓴 결과 번호를 evidence_ids에 넣어라.
 차별점과 비교 문장은 수치·사실(성능 수치, 공정, 특허, 고객)로 쓴다. 회사 보도자료의 홍보 표현('최적화된 성능',
-'혁신적인', '획기적인', '탁월한')은 옮기지 않는다. 수치 근거가 없는 차별점은 "수치 근거 없음"을 붙인다.
+'혁신적인', '획기적인', '탁월한')은 옮기지 않는다. 수치·사실 근거가 없는 차별점은 쓰지 않는다.
+문장 안에 검색 결과 번호([1] 등)를 넣지 않는다. 번호는 evidence_ids에만 넣는다.
 
 {results}"""
 
@@ -120,6 +122,16 @@ def _norm(s: str) -> str:
 
 
 NOT_FOUND = "같은 세부 분야 경쟁사를 공개 자료로 확인하지 못함"
+# LLM이 문장 안에 남긴 검색 결과 번호 ([3], [2,5]). 보고서 출처 번호와 섞이면 다른 출처를 가리키게 된다
+RESULT_REF = re.compile(r"\s*\[\d{1,3}(?:\s*[,~\-]\s*\d{1,3})*\]")
+
+
+def _strip_refs(analysis: dict) -> dict:
+    for c in analysis.get("competitors") or []:
+        c["comparison"] = RESULT_REF.sub("", c.get("comparison", ""))
+    for key in ("differentiation", "competitive_risks"):
+        analysis[key] = [RESULT_REF.sub("", x) for x in analysis.get(key) or []]
+    return analysis
 
 
 def rework_queries(name: str, product: str, segment: str, focus: list[str]) -> tuple[list[str], list[str]]:
@@ -201,6 +213,7 @@ def competitor_node(state: dict) -> dict:
     if not analysis["competitors"]:
         analysis["competitive_risks"].append(NOT_FOUND)
     used = [results[i] for i in dict.fromkeys(evidence_ids) if 0 <= i < len(results)]
+    analysis = _strip_refs(analysis)
     prev = previous(state, "competitor_analysis") if rework else None
     if prev:
         analysis = _merge_previous(prev, analysis)
