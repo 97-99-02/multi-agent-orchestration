@@ -37,7 +37,8 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase.ttfonts import TTFError, TTFont
-from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import (CondPageBreak, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table,
+                                TableStyle)
 from reportlab.platypus.doctemplate import LayoutError
 
 from config import (ALLOWED_ROUNDS, CORE_CAUTION_SCORE, CORE_ITEMS, CORE_MIN_SCORE, INVEST_THRESHOLD,
@@ -70,7 +71,9 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
    - 추가 확인이 필요한 사항 (1~2개). [분석 자료]에 summary_caution이 있으면 그 내용(항목명과 점수)을
      한 항목으로 반드시 포함합니다. (예: 기술·제품 성숙도 2점(정보 부족으로 제한) 확인 필요)
 6. 'REFERENCE' 장은 쓰지 않습니다. (코드가 실제 사용 출처로 자동 첨부합니다.)
-7. 본문 전체는 8장(페이지) 이내 분량, 한글 기준 약 12,000자 이내로 간결하게 씁니다. (PDF는 대시보드·REFERENCE 포함 10장 이내)
+7. 본문 전체는 한글 기준 약 10,000~14,000자로 씁니다. (PDF는 대시보드·REFERENCE 포함 7~10장)
+   1~4장(관점 장)은 [분석 자료]에 있는 사실을 빠짐없이 2~4문단으로 자세히 씁니다. 분량을 채우려고 자료에 없는 내용이나
+   같은 말 반복을 넣지 않습니다. 자료가 적은 장은 짧아도 됩니다.
 8. '투자 판단 결과' 장에는 점수표를 직접 쓰지 말고, 표가 들어갈 자리에 {{SCORE_TABLE}} 한 줄만 쓰세요.
    그 아래에 항목별 근거를 문장으로 해설합니다. (표는 코드가 자동으로 채웁니다.)
 9. 수치나 사실을 말하는 문장 끝에는 [분석 자료]의 sources_for_citation에 있는 번호를 [1]처럼 붙이세요.
@@ -185,6 +188,7 @@ ANALYSIS_KEYS = (
 SUMMARY_MAX_CHARS = 900     # A4 반 페이지 ≈ 한글 900자 (대략치. 조에서 조정 가능)
 PAGE_CHARS = 1800           # A4 한 페이지 ≈ 한글 1,800자 (대략치)
 MAX_PAGES = 10              # 과제 조건: 최대 10장 (Agent 과제)
+MIN_PAGES = 7               # 조 기준: 최소 7장 (PDF 조판 간격을 키워 맞춘다, 내용은 늘리지 않음)
 SUMMARY_BULLETS = 3         # SUMMARY 틀: 핵심 근거·핵심 리스크 각 3개
 CONFIRM_BULLETS = (1, 2)    # SUMMARY 틀: 확인 필요 1~2개
 SUMMARY_LABELS = ("**결론:**", "**핵심 근거**", "**핵심 리스크**", "**확인 필요**")
@@ -790,7 +794,15 @@ PAGE_MARGIN = 16 * mm
 BOTTOM_EXTRA = 4 * mm                          # 바닥글 자리
 USABLE_PAGE_HEIGHT = A4[1] - 2 * PAGE_MARGIN - BOTTOM_EXTRA   # 한 쪽의 본문 높이
 SUMMARY_MAX_PAGE_RATIO = 0.5                   # 과제 조건: SUMMARY는 1/2 페이지 이내
-BODY_SIZE, SMALL_SIZE = 9.5, 8
+BODY_SIZE, SMALL_SIZE = 10, 8.5
+LINE_RATIO = 1.8                               # 줄 간격 (글자 크기 배수)
+PARA_GAP, BULLET_GAP = 7, 3                    # 문단·글머리표 뒤 간격(pt)
+SECTION_GAP, HEADING_GAP = 18, 8               # 장 제목 앞·뒤 간격(pt)
+# 이 장들은 쪽에 남은 공간이 PAGE_BREAK_ROOM보다 적으면 새 쪽에서 시작한다 (강제로 넘기면 앞 장의 마지막
+# 한두 줄만 있는 빈 쪽이 생겼다). REFERENCE와 본문 1장은 항상 새 쪽 (1쪽은 제목 밴드·SUMMARY·대시보드만)
+PAGE_BREAK_BEFORE = ("경쟁 구도", "투자 판단 결과")
+PAGE_BREAK_ROOM = 0.45
+LAYOUT_SCALES = (1.0, 1.15, 1.3, 1.45, 1.6)       # MIN_PAGES에 못 미치면 간격 배율을 차례로 키워 다시 조판
 DASH_HEIGHT = 168                              # 대시보드 카드·차트 높이(pt)
 CARD_RATIO = 0.42                              # 대시보드에서 왼쪽 카드가 차지하는 폭 비율
 SCORE_BAR_W, SCORE_BAR_H = 70, 9
@@ -868,20 +880,28 @@ def _inline(text: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
 
 
+_LAYOUT_SCALE = 1.0   # export_report_pdf가 MIN_PAGES를 맞추려고 바꾸는 간격 배율
+
+
+def _gap(points: float) -> float:
+    return points * _LAYOUT_SCALE
+
+
 def _styles(font: str, bold: str, size: float = BODY_SIZE) -> dict[str, ParagraphStyle]:
-    """본문 크기(size)에 맞춘 문단 스타일 묶음."""
+    """본문 크기(size)에 맞춘 문단 스타일 묶음. 줄·문단 간격은 _LAYOUT_SCALE배."""
     base = dict(fontName=font, alignment=TA_LEFT, textColor=_hex(INK))
-    lead = size * 1.6
+    lead = size * LINE_RATIO * (1 + (_LAYOUT_SCALE - 1) / 2)   # 줄 간격은 배율의 절반만 키운다
     return {
-        "body": ParagraphStyle("body", fontSize=size, leading=lead, spaceAfter=3, **base),
-        "bullet": ParagraphStyle("bullet", fontSize=size, leading=lead, leftIndent=11, bulletIndent=2, **base),
+        "body": ParagraphStyle("body", fontSize=size, leading=lead, spaceAfter=_gap(PARA_GAP), **base),
+        "bullet": ParagraphStyle("bullet", fontSize=size, leading=lead, leftIndent=11, bulletIndent=2,
+                                 spaceAfter=_gap(BULLET_GAP), **base),
         "sub": ParagraphStyle("sub", fontSize=size - 0.5, leading=lead - 1, leftIndent=24, bulletIndent=14,
                               **{**base, "textColor": _hex(MUTED)}),
         "label": ParagraphStyle("label", fontSize=size, leading=lead, spaceBefore=3,
                                 **{**base, "fontName": bold, "textColor": _hex(NAVY)}),
         "h1": ParagraphStyle("h1", fontSize=16, leading=22, spaceAfter=6, **{**base, "fontName": bold}),
-        "h2": ParagraphStyle("h2", fontSize=12.5, leading=17, **{**base, "fontName": bold, "textColor": _hex(NAVY)}),
-        "h3": ParagraphStyle("h3", fontSize=size + 1, leading=(size + 1) * 1.4, spaceBefore=4, spaceAfter=2,
+        "h2": ParagraphStyle("h2", fontSize=13.5, leading=19, **{**base, "fontName": bold, "textColor": _hex(NAVY)}),
+        "h3": ParagraphStyle("h3", fontSize=size + 1, leading=(size + 1) * 1.4, spaceBefore=_gap(6), spaceAfter=_gap(3),
                              keepWithNext=1, **{**base, "fontName": bold}),   # 소제목이 쪽 끝에 홀로 남지 않게
         "cell": ParagraphStyle("cell", fontSize=size - 0.5, leading=(size - 0.5) * 1.5, **base),
     }
@@ -1110,13 +1130,15 @@ def render_blocks(blocks: list[dict], font: str, bold: str, width: float, has_da
             inner = [Paragraph("SUMMARY", normal["h2"])] + content_flowables(lines, normal, width - 24, font)
             flow += [Spacer(1, 4), _panel(inner, width, PANEL, NAVY)]
         elif level == 2 and "REFERENCE" in upper:
-            heading, gap = _heading2(title, small, width), Spacer(1, 3)
+            heading, gap = _heading2(title, small, width), Spacer(1, _gap(HEADING_GAP))
             heading.keepWithNext = gap.keepWithNext = True  # 제목만 쪽 끝에 홀로 남지 않게
-            flow += [Spacer(1, 8), heading, gap]
+            flow += [PageBreak(), heading, gap]
             flow += content_flowables(lines, small, width, font)
         elif level == 2:
             body = content_flowables(lines, normal, width, font)
-            flow += [Spacer(1, 7), KeepTogether([_heading2(title, normal, width), Spacer(1, 3)] + body[:2])]
+            opener = ([CondPageBreak(USABLE_PAGE_HEIGHT * PAGE_BREAK_ROOM)] if any(k in title for k in PAGE_BREAK_BEFORE)
+                      else []) + [Spacer(1, _gap(SECTION_GAP))]
+            flow += opener + [KeepTogether([_heading2(title, normal, width), Spacer(1, _gap(HEADING_GAP))] + body[:2])]
             flow += body[2:]
         elif level == 3 and title.startswith(NOTE_TITLE):
             inner = [Paragraph(_inline(title), small["label"])] + content_flowables(lines, small, width - 24, font)
@@ -1407,7 +1429,7 @@ def _page_decorations(font: str, label: str, counter: dict):
 # ── PDF 저장 ─────────────────────────────────────────────────
 def export_report_pdf(report: str, output_dir: Path = OUTPUT_DIR, filename: str | None = None,
                       state: dict | None = None, report_date: str | None = None) -> tuple[Path, int]:
-    """보고서를 PDF로 저장하고 (저장 경로, 페이지 수)를 돌려준다. 5장을 넘으면 경고한다.
+    """보고서를 PDF로 저장하고 (저장 경로, 페이지 수)를 돌려준다. MIN_PAGES~MAX_PAGES를 벗어나면 경고한다.
 
     state를 함께 주면 1쪽에 '제목 밴드 → SUMMARY → 결정 대시보드' 순서로 그린다. (없으면 본문만)
     SUMMARY가 실제 조판 기준으로 반 페이지를 넘으면 경고한다.
@@ -1432,8 +1454,10 @@ def export_report_pdf(report: str, output_dir: Path = OUTPUT_DIR, filename: str 
                            if has_result else ([], []))
         until_summary, after_summary = _split_at_summary(parse_blocks(report))
         has_band = bool(header)
-        return (header + render_blocks(until_summary, font, bold, width, has_band)
-                + visuals + render_blocks(after_summary, font, bold, width, has_band))
+        rest = render_blocks(after_summary, font, bold, width, has_band)
+        if rest and not isinstance(rest[0], PageBreak):
+            rest = [PageBreak()] + rest   # 1쪽은 제목 밴드·SUMMARY·대시보드만
+        return header + render_blocks(until_summary, font, bold, width, has_band) + visuals + rest
 
     ratio = measure_summary_ratio(report)  # SUMMARY가 반 페이지를 넘는지 실제 높이로 확인
     if ratio > SUMMARY_MAX_PAGE_RATIO:
@@ -1452,18 +1476,41 @@ def export_report_pdf(report: str, output_dir: Path = OUTPUT_DIR, filename: str 
         doc.build(make_story(), onFirstPage=first, onLaterPages=later)
         return counter
 
-    global _PLAIN_FIGURES
-    try:
-        counter = build()
-    except LayoutError as e:
-        logger.warning("[PDF] 경쟁 구도 그림이 한 쪽을 넘어 일반 표로 다시 저장합니다: %s", str(e)[:120])
-        _PLAIN_FIGURES = True
+    global _PLAIN_FIGURES, _LAYOUT_SCALE
+
+    def build_once() -> dict:
+        global _PLAIN_FIGURES
         try:
-            counter = build()
-        finally:
-            _PLAIN_FIGURES = False
+            return build()
+        except LayoutError as e:
+            logger.warning("[PDF] 경쟁 구도 그림이 한 쪽을 넘어 일반 표로 다시 저장합니다: %s", str(e)[:120])
+            _PLAIN_FIGURES = True
+            try:
+                return build()
+            finally:
+                _PLAIN_FIGURES = False
+
+    # 최소 쪽수(MIN_PAGES)에 못 미치면 간격 배율을 키워 다시 조판한다. 최대 쪽수를 넘기 직전 배율에서 멈춘다
+    try:
+        counter, used = build_once(), LAYOUT_SCALES[0]
+        for scale in LAYOUT_SCALES[1:]:
+            if counter["n"] >= MIN_PAGES:
+                break
+            _LAYOUT_SCALE = scale
+            trial = build_once()
+            if trial["n"] > MAX_PAGES:
+                _LAYOUT_SCALE = used
+                counter = build_once()   # 넘친 배율 대신 직전 배율로 다시 저장
+                break
+            counter, used = trial, scale
+    finally:
+        _LAYOUT_SCALE = 1.0
+    if used != LAYOUT_SCALES[0]:
+        logger.info("[PDF] 최소 %d장을 맞추려고 간격 배율 %.2f로 조판", MIN_PAGES, used)
 
     pages = counter["n"]
+    if pages < MIN_PAGES:
+        logger.warning("[PDF] %d장으로 최소 %d장에 못 미칩니다 (간격 배율 최대 %.2f).", pages, MIN_PAGES, used)
     if pages > MAX_PAGES:
         logger.warning("[PDF] %d장으로 과제 기준(%d장 이내)을 넘었습니다. 본문을 줄이세요.", pages, MAX_PAGES)
     else:

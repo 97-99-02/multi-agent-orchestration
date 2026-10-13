@@ -147,3 +147,23 @@ def make_report_for_coverage(domain_section):
     chapters = [f"## {i}. {name}\n2025년 기준 내용[1]. {filler}[2]\n" for i, name in
                 [(1, "사업 아이디어·기술 성숙도"), (2, "시장성"), (3, "이해관계자")]]
     return "\n".join(chapters) + domain_section + "## REFERENCE\n- [1] A(2026). x\n- [2] B(2026). y\n- [4] C(2026). z\n"
+
+
+# ---------- PDF 분량 (최소 7장 ~ 최대 10장) ----------
+SHORT = ("## SUMMARY\n**결론:** 요약.\n## 1. 사업 아이디어·기술 성숙도\n" + "기술 내용 문장이다[1]. " * 40
+         + "\n## 7. 사업 리스크\n리스크[1].\n## REFERENCE\n### 웹페이지\n- [1] 매체(2026). 기사. x.com, https://x.com\n")
+
+
+def test_short_report_is_typeset_with_larger_spacing(tmp_path, monkeypatch):
+    _, scaled = reporter.export_report_pdf(SHORT, output_dir=tmp_path, filename="scaled.pdf")
+    monkeypatch.setattr(reporter, "LAYOUT_SCALES", (1.0,))
+    _, base = reporter.export_report_pdf(SHORT, output_dir=tmp_path, filename="base.pdf")
+    assert scaled >= base
+    assert reporter._LAYOUT_SCALE == 1.0          # 조판이 끝나면 배율을 되돌린다
+
+
+def test_body_starts_on_new_page_after_summary(tmp_path):
+    # SUMMARY와 본문 1장이 같은 쪽에 붙지 않는다 (1쪽은 제목·SUMMARY·대시보드만)
+    report = "## SUMMARY\n요약.\n## 1. 사업 아이디어·기술 성숙도\n짧은 본문[1].\n## REFERENCE\n### 웹페이지\n- [1] 매체(2026). 기사.\n"
+    _, pages = reporter.export_report_pdf(report, output_dir=tmp_path, filename="p.pdf")
+    assert pages >= 3                             # SUMMARY 쪽, 본문 쪽, REFERENCE 쪽

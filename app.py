@@ -10,6 +10,7 @@
 마지막 체크포인트부터 이어간다 (재개/복구, 최대 MAX_RESUME회). 프로세스를 다시 띄워 이어가려면
 SqliteSaver(langgraph-checkpoint-sqlite)로 바꿔야 한다.
 """
+import json
 import logging
 import uuid
 from datetime import datetime
@@ -64,6 +65,11 @@ def main():
     path = out_dir / f"report_{datetime.now():%Y%m%d_%H%M}_{trace_id[:8]}.md"
     path.write_text(state["report"], encoding="utf-8")
     print(f"보고서 저장: {path}")
+    # 최종 State를 남겨 두면 PDF 모양만 고칠 때 다시 실행하지 않고 같은 결과로 다시 만들 수 있다
+    state_path = out_dir / "runs" / f"state_{trace_id}.json"
+    state_path.parent.mkdir(exist_ok=True)
+    state_path.write_text(json.dumps(state, ensure_ascii=False, indent=1, default=str), encoding="utf-8")
+    print(f"최종 State 저장: {state_path}")
     pdf_path, pages = export_report_pdf(state["report"], state=state)
     print(f"제출용 PDF 저장: {pdf_path} ({pages}쪽)")
     print(f"trace_id: {trace_id} (LangSmith run: {config['run_name']})")
