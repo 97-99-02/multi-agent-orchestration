@@ -62,3 +62,34 @@ def test_run_gives_up_after_max_resume():
     with pytest.raises(ConnectionError):
         runner.run(fake_app(s, {"reporter": broken_reporter}), trace_id="t-fail")
     assert len(obs.read_events("t-fail", kind="resume")) == MAX_RESUME
+
+
+# ---------- 프로그램을 다시 켜서 이어가기 (SqliteSaver) ----------
+def test_resume_after_restart_from_sqlite_checkpoint(tmp_path):
+    s = Scenario(["A사"], {"A사": "투자"})
+    db = tmp_path / "checkpoints.sqlite"
+
+    def broken_reporter(state):
+        raise ConnectionError("OpenAI 장애")
+
+    first = build_graph({**s.nodes(), "reporter": broken_reporter}, checkpointer=runner.make_checkpointer(db))
+    with pytest.raises(ConnectionError):
+        runner.run(first, trace_id="t-restart")
+    # 새 프로그램: 그래프·체크포인터를 새로 만들고 같은 DB 파일에서 이어간다
+    second = build_graph(s.nodes(), checkpointer=runner.make_checkpointer(db))
+    state, _ = runner.run(second, trace_id="t-restart", resume=True)
+    assert state["report"] == "보고서 v1"
+    assert s.calls.count("explorer") == 1 and s.calls.count("judge") == 1    # 앞 단계는 다시 하지 않음
+    assert any(e["error"].startswith("(프로그램을 다시 켜서") for e in obs.read_events("t-restart", kind="resume"))
+
+
+def test_resume_unknown_or_finished_run(tmp_path):
+    s = Scenario(["A사"], {"A사": "투자"})
+    db = tmp_path / "checkpoints.sqlite"
+    graph = build_graph(s.nodes(), checkpointer=runner.make_checkpointer(db))
+    with pytest.raises(SystemExit):
+        runner.run(graph, trace_id="없는-실행", resume=True)
+    runner.run(graph, trace_id="t-done")
+    calls = len(s.calls)
+    state, _ = runner.run(graph, trace_id="t-done", resume=True)
+    assert state["report"] and len(s.calls) == calls                      # 끝난 실행은 다시 돌리지 않음
