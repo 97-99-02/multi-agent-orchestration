@@ -41,6 +41,7 @@ from reportlab.platypus import (CondPageBreak, KeepTogether, PageBreak, Paragrap
                                 TableStyle)
 from reportlab.platypus.doctemplate import LayoutError
 
+from agents.competitor import NO_COMPARISON, claim_text
 from agents.judge import RUBRIC
 from config import (ALLOWED_ROUNDS, CORE_CAUTION_SCORE, CORE_ITEMS, CORE_MIN_SCORE, INVEST_THRESHOLD,
                     MAX_CANDIDATES, MODEL_ANALYZE)
@@ -247,6 +248,7 @@ STRENGTH_HEADER, RISK_HEADER = "차별점(강점)", "경쟁 리스크"   # 2칸 
 TIMELINE_HEADER = "보도일"                            # 1장 개발 단계 타임라인
 RUBRIC_POSITION_HEADER = "채점 항목"                  # 6장 기준표 대비 위치
 SCORE_BASIS_HEADER = "판단 항목"                      # 6장 항목별 판단 근거
+COMPARISON_HEADER = "경쟁사"                          # 5장 경쟁 구도 그림 아래 비교 근거 표 (PDF)
 TIMELINE_CAPTION = "**개발 단계 보도 시점** (기사 게시일 순, 사건 시점과 다를 수 있음)"
 RUBRIC_POSITION_CAPTION = "**기준표 대비 위치** (현재 점수 구간과 다음 점수 조건)"
 SCORE_BASIS_CAPTION = "**항목별 판단 근거**"
@@ -400,33 +402,56 @@ def _cell(text) -> str:
     return (text or "–").replace("|", "/").replace("\n", " ").strip()
 
 
-def build_competitor_table(state: dict) -> str:
+EXCLUDED_PREFIX = "다른 세부 분야라 비교에서 제외"
+NOT_COMPARABLE_PREFIX = "직접 비교할 수 없는 항목"
+
+
+def _claims_cell(claims: list, sources: list[dict], target: str, owner: str = "") -> str:
+    """경쟁사 분석의 주장들을 표 칸 하나로: 문장(발표 주체) + 보고서 출처 번호. 예전 결과(문자열)는 그대로."""
+    parts = []
+    for c in claims:
+        if isinstance(c, dict):
+            cite = _citations_for_urls(sources, [c.get("url", "")]) if c.get("url") else ""
+            parts.append(f"{_cell(claim_text(c, target, owner))} {cite}".strip())
+        else:
+            parts.append(_cell(c))
+    return " ".join(parts)
+
+
+def build_competitor_table(state: dict, sources: list[dict] | None = None) -> str:
     """5장 경쟁 구도: ① 구도 표(평가 대상·선도 기업·동급 기업) ② 차별점·경쟁 리스크 표. 값은 competitor_analysis 그대로.
 
     마크다운에서는 표로 읽히고, PDF에서는 첫 칸 제목('구분'/'차별점')을 보고 구도 그림과 2칸 패널로 그린다.
+    비교·차별점은 경쟁사 분석이 확인한 주장만, 발표 주체와 출처 번호를 붙여 쓴다.
     """
     analysis = state.get("competitor_analysis") or {}
     company = state.get("company") or {}
+    sources = sources or []
+    target = company.get(COMPANY_NAME_KEY) or ""
     competitors = sorted(analysis.get("competitors") or [], key=lambda c: c.get("tier") != LEADING_TIER)
     if not competitors:
         return "(같은 세부 분야에서 비교할 경쟁사를 찾지 못했습니다.)"
     country = "한국" if company.get("is_domestic") else ""
-    lines = [f"| {LANDSCAPE_HEADER} | 기업 | 국가 | 제품 | 비교 |", "|---|---|---|---|---|",
-             f"| {TARGET_TIER} | {_cell(company.get(COMPANY_NAME_KEY))} | {_cell(country)} "
-             f"| {_cell(company.get('product'))} | – |"]
-    lines += [f"| {_cell(c.get('tier'))} | {_cell(c.get('name'))} | {_cell(c.get('country'))} "
-              f"| {_cell(c.get('product'))} | {_cell(c.get('comparison'))} |" for c in competitors]
+    lines = [f"| {LANDSCAPE_HEADER} | 기업 | 국가 | 제품 | 소개 | 비교 근거 |", "|---|---|---|---|---|---|",
+             f"| {TARGET_TIER} | {_cell(target)} | {_cell(country)} | {_cell(company.get('product'))} | – | – |"]
+    for c in competitors:
+        claims = c.get("claims")
+        compared = (_claims_cell(claims, sources, target, c.get("name", "")) if claims
+                    else NO_COMPARISON if claims is not None else _cell(c.get("comparison")))
+        lines.append(f"| {_cell(c.get('tier'))} | {_cell(c.get('name'))} | {_cell(c.get('country'))} "
+                     f"| {_cell(c.get('product'))} | {_cell(c.get('summary'))} | {compared} |")
 
     strengths, risks = analysis.get("differentiation") or [], analysis.get("competitive_risks") or []
     if strengths or risks:
         lines += ["", f"| {STRENGTH_HEADER} | {RISK_HEADER} |", "|---|---|"]
         for i in range(max(len(strengths), len(risks))):
-            left = _cell(strengths[i]) if i < len(strengths) else ""
+            left = _claims_cell([strengths[i]], sources, target) if i < len(strengths) else ""
             right = _cell(risks[i]) if i < len(risks) else ""
             lines.append(f"| {left} | {right} |")
-    excluded = analysis.get("excluded_other_segment") or []
-    if excluded:
-        lines += ["", f"다른 세부 분야라 비교에서 제외: {', '.join(excluded)}"]
+    for prefix, items in ((NOT_COMPARABLE_PREFIX, analysis.get("not_comparable")),
+                          (EXCLUDED_PREFIX, analysis.get("excluded_other_segment"))):
+        if items:
+            lines += ["", f"{prefix}: {'; '.join(_cell(x) for x in items)}"]
     return "\n".join(lines)
 
 
@@ -470,10 +495,11 @@ def _insert_table(body: str, placeholder: str, table: str, section: re.Pattern, 
     return body
 
 
-def insert_competitor_table(body: str, state: dict) -> str:
+def insert_competitor_table(body: str, state: dict, sources: list[dict] | None = None) -> str:
     """5장의 자리표시자를 경쟁사 표로 바꾼다. 자리표시자가 없으면 5장 제목 아래에 넣는다.
-    (경쟁사 출처 번호는 표 아래 해설 문장에 보고서 LLM이 붙인다. 번호만 나열한 줄은 사실 검증이 주장 없는 문장으로 잡았다)"""
-    return _insert_table(body, COMPETITOR_PLACEHOLDER, build_competitor_table(state), COMPETITOR_SECTION_PATTERN, "경쟁사 표")
+    (번호만 나열한 출처 줄은 사실 검증이 주장 없는 문장으로 잡아, 출처 번호는 주장마다 붙인다)"""
+    return _insert_table(body, COMPETITOR_PLACEHOLDER, build_competitor_table(state, sources),
+                         COMPETITOR_SECTION_PATTERN, "경쟁사 표")
 
 
 def _citations_for_urls(sources: list[dict], urls: list[str]) -> str:
@@ -852,7 +878,7 @@ def assemble_report(state: dict, body: str, sources: list[dict]) -> str:
     if _is_recommend_mode(state):
         body = insert_score_table(body, state["scores"])
         body = insert_score_basis_tables(body, state["scores"], sources)
-        body = insert_competitor_table(body, state)
+        body = insert_competitor_table(body, state, sources)
         body = insert_timeline_table(body, state, sources)
         body, sources = keep_cited_sources(body, sources)   # REFERENCE에는 본문에서 인용한 출처만
     else:  # 추천 없음 보고서: 점수표·경쟁사 표 대신 2장에 후보별 결과 표(코드가 State에서 만든다)
@@ -927,7 +953,7 @@ def previous_body(state: dict, sources: list[dict]) -> str:
         text = _strip_code_tables(text)
         if any(k in title for k in TABLE_CHAPTERS):   # 코드가 넣은 표를 지우고 자리 표시로
             kept = [ln for ln in text.splitlines() if not ln.strip().startswith("|")
-                    and not ln.startswith("다른 세부 분야라 비교에서 제외")]
+                    and not ln.startswith((EXCLUDED_PREFIX, NOT_COMPARABLE_PREFIX))]
             mark = COMPETITOR_PLACEHOLDER if "경쟁 구도" in title else PLACEHOLDER
             text = "\n" + mark + "\n" + "\n".join(kept).strip() + "\n"
         chapters.append(f"## {title}\n{text.strip()}\n")
@@ -1102,6 +1128,7 @@ TABLE_FRACS = {                                # 표 첫 칸 제목 → 열 폭 
     TIMELINE_HEADER: (0.14, 0.72, 0.14),        # 개발 단계 타임라인: '내용' 칸을 넓게
     RUBRIC_POSITION_HEADER: (0.17, 0.25, 0.29, 0.29),   # 점수 칸은 점수 막대가 들어가 점수표만큼 넓게
     SCORE_BASIS_HEADER: (0.18, 0.68, 0.14),     # 항목별 판단 근거: '판단 근거' 칸을 넓게
+    COMPARISON_HEADER: (0.2, 0.8),              # 경쟁사 비교 근거
 }
 
 # State 안의 company 키 후보 (팀원 State와 다르면 여기만 수정)
@@ -1287,31 +1314,41 @@ SENTENCE_END = re.compile(r"(?<=[.!?])\s|(?<=다\.)")
 
 
 def _short(text: str, limit: int) -> str:
-    """첫 문장만, 그래도 길면 limit 글자에서 단어 단위로 자른다."""
+    """첫 문장이 limit 글자 안이면 첫 문장, 아니면 빈 문자열.
+    (중간에 잘라 '…'을 붙이면 읽는 사람이 원문을 알 수 없어, 카드에는 짧은 소개만 싣고 긴 글은 싣지 않는다)"""
     text = (text or "").strip()
     first = SENTENCE_END.split(text, maxsplit=1)[0].strip() if text else ""
-    if len(first) <= limit:
-        return first
-    cut = first[:limit].rsplit(" ", 1)[0]
-    return cut.rstrip(",·;:") + "…"
+    return first if len(first) <= limit else ""
+
+
+def comparison_rows(block: list[str]) -> list[str]:
+    """경쟁 구도 표(새 형식)에서 경쟁사별 비교 근거만 뽑아 2칸 표 줄로. 예전 형식이면 빈 목록 (카드에 비교 문장이 있다)."""
+    header, *rows = _md_rows(block)
+    if len(header) < 6:
+        return []
+    body = [f"| {r[1]} | {r[5]} |" for r in rows if len(r) >= 6 and r[0] != TARGET_TIER]
+    return [f"| {COMPARISON_HEADER} | 비교 근거 (발표 주체, 출처) |", "|---|---|", *body] if body else []
 
 
 def _landscape(block: list[str], styles: dict, width: float) -> Table:
     """경쟁 구도 그림: [선도 기업(진입 위협)] ← [평가 대상] → [동급 기업(직접 경쟁)]."""
-    rows = _md_rows(block)[1:]   # 첫 줄은 제목
+    header, *rows = _md_rows(block)
+    with_intro = len(header) >= 6   # 새 형식: 구분|기업|국가|제품|소개|비교 근거 (예전 보고서는 소개 칸이 없다)
     groups = {LEADING_TIER: [], TARGET_TIER: [], PEER_TIER: []}
     for row in rows:
-        tier, name, country, product, comparison = (row + [""] * 5)[:5]
-        groups[tier if tier in groups else PEER_TIER].append((name, country, product, comparison))
+        tier, name, country, product, intro, comparison = (
+            (row + [""] * 6)[:6] if with_intro else [*(row + [""] * 5)[:4], "", (row + [""] * 5)[4]])
+        groups[tier if tier in groups else PEER_TIER].append((name, country, product, intro, comparison))
 
-    def card(name, country, product, comparison):
+    def card(name, country, product, intro, comparison):
         # 경쟁사 설명이 길면(영문 소개문 등) 그림이 한 쪽 남은 공간보다 커져 통째로 다음 쪽으로 넘어가고
-        # 앞 쪽이 비었다. 그림 카드에는 첫 문장만 짧게 싣는다 (보고서 본문 표에는 전체가 남아 있다)
-        product, comparison = _short(product, CARD_PRODUCT_CHARS), _short(comparison, CARD_TEXT_CHARS)
+        # 앞 쪽이 비었다. 카드에는 짧은 소개만 싣고, 비교 근거는 그림 아래 표에 출처 번호와 함께 싣는다
+        product = product if len(product) <= CARD_PRODUCT_CHARS else _short(product, CARD_PRODUCT_CHARS)
+        text_line = _short(intro, CARD_TEXT_CHARS) if with_intro else _short(comparison, CARD_TEXT_CHARS)
         meta = " · ".join(v for v in (country, product) if v and v != "–")
         text = f"<b>{_inline(name)}</b>" + (f' <font size="7.5" color="{MUTED}">{_inline(meta)}</font>' if meta else "")
-        if comparison and comparison != "–":
-            text += f'<br/><font size="7.5">{_inline(comparison)}</font>'
+        if text_line and text_line != "–":
+            text += f'<br/><font size="7.5">{_inline(text_line)}</font>'
         return Paragraph(text, styles["cell"])
 
     none = [Paragraph(f'<font color="{MUTED}">해당 기업 없음</font>', styles["cell"])]
@@ -1320,7 +1357,7 @@ def _landscape(block: list[str], styles: dict, width: float) -> Table:
                        [card(*g) for g in groups[LEADING_TIER]] or none, side_w - 2, PANEL, HOLD, styles)
     right = _column_box(f"{PEER_TIER} · 비상장 스타트업", "직접 경쟁 (비슷한 단계)",
                         [card(*g) for g in groups[PEER_TIER]] or none, side_w - 2, PANEL, NAVY, styles)
-    target = groups[TARGET_TIER][0] if groups[TARGET_TIER] else ("", "", "", "")
+    target = groups[TARGET_TIER][0] if groups[TARGET_TIER] else ("", "", "", "", "")
     mid_style = ParagraphStyle("mid", parent=styles["cell"], textColor=colors.white, alignment=1)
     mid = Table([[Paragraph('<font size="7.5">평가 대상</font>', mid_style)],
                  [Paragraph(f'<font size="11"><b>{_inline(target[0])}</b></font>', mid_style)],
@@ -1377,8 +1414,11 @@ def content_flowables(lines: list[str], styles: dict, width: float, font: str) -
             first = _md_rows(block)[0][0] if _md_rows(block) else ""
             if _PLAIN_FIGURES:                 # 저장 재시도: 그림 대신 일반 표
                 flow += [_table(block, styles, width, font), Spacer(1, 4)]
-            elif first == LANDSCAPE_HEADER:    # 경쟁 구도 표 → 구도 그림
+            elif first == LANDSCAPE_HEADER:    # 경쟁 구도 표 → 구도 그림 + 비교 근거 표
                 flow += [Spacer(1, 2), _landscape(block, styles, width), Spacer(1, 6)]
+                evidence = comparison_rows(block)
+                if evidence:
+                    flow += [_table(evidence, styles, width, font), Spacer(1, 6)]
             elif first == STRENGTH_HEADER:     # 차별점·경쟁 리스크 표 → 2칸 패널
                 flow += [_two_panels(block, styles, width), Spacer(1, 6)]
             else:
@@ -1461,7 +1501,9 @@ def render_blocks(blocks: list[dict], font: str, bold: str, width: float, has_da
             if "경쟁 구도" in title:
                 # 경쟁 구도 그림·패널은 쪽을 나눌 수 없는 큰 덩어리라, 먼저 오면 앞 쪽 남은 공간이 통째로 비었다.
                 # 해설 문단을 먼저 두어 남은 공간을 채우고 그림은 그 뒤에 둔다
-                text = [f for f in body if not isinstance(f, (Table, Spacer))]
+                # 비교 불가·분야 제외 줄은 비교 근거라 그림 뒤에 둔다
+                text = [f for f in body if not isinstance(f, (Table, Spacer))
+                        and not getattr(f, "text", "").startswith((EXCLUDED_PREFIX, NOT_COMPARABLE_PREFIX))]
                 body = text + [f for f in body if f not in text]
             opener = ([CondPageBreak(USABLE_PAGE_HEIGHT * PAGE_BREAK_ROOM)] if any(k in title for k in PAGE_BREAK_BEFORE)
                       else []) + [Spacer(1, _gap(SECTION_GAP))]

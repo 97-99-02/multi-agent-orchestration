@@ -182,6 +182,40 @@ def test_competitor_table_has_no_bare_source_line_and_sources_show_their_agent()
     assert reporter.build_materials(full, sources)["sources_for_citation"][0]["used_by"] == ["competitor", "team"]
 
 
+CHECKED = {"competitor_analysis": {
+    "competitors": [{"name": "Qualcomm", "tier": "선도 기업", "country": "미국", "product": "Snapdragon", "summary": "모바일 AP·NPU",
+                     "claims": [], "comparison": "비교 근거 없음"},
+                    {"name": "NVIDIA", "tier": "선도 기업", "country": "미국", "product": "Jetson Orin", "summary": "엣지 AI 모듈",
+                     "claims": [{"text": "젯슨 오린 275 TOPS", "speaker": "경쟁사", "basis": "수치", "url": "https://b.com/2"}]}],
+    "differentiation": [{"text": "NPU용 SDK 제공", "speaker": "대상 기업", "basis": "사실", "kind": "소프트웨어 개발 환경",
+                         "url": "https://a.com/1"}],
+    "competitive_risks": ["퀄컴의 시장 진입"], "not_comparable": ["TOPS/W: 측정 조건이 다름"]},
+    "company": {"name": "모빌린트", "product": "ARIES"}}
+CHECKED_SOURCES = [{"n": 4, "raw": [{"url": "https://a.com/1"}]}, {"n": 7, "raw": [{"url": "https://b.com/2"}]}]
+
+
+def test_competitor_table_shows_who_announced_and_cites_each_claim():
+    table = reporter.build_competitor_table(CHECKED, CHECKED_SOURCES)
+    assert "| 엣지 AI 모듈 | 젯슨 오린 275 TOPS (NVIDIA 발표) [7] |" in table
+    assert "| 모바일 AP·NPU | 비교 근거 없음 |" in table
+    assert "NPU용 SDK 제공 (모빌린트 발표) [4]" in table
+    assert "직접 비교할 수 없는 항목: TOPS/W: 측정 조건이 다름" in table
+
+
+def test_pdf_puts_comparison_evidence_under_the_figure_not_in_cards():
+    block = reporter.build_competitor_table(CHECKED, CHECKED_SOURCES).split("\n\n")[0].splitlines()   # 구도 표만
+    rows = reporter.comparison_rows(block)
+    assert rows[0].startswith(f"| {reporter.COMPARISON_HEADER} |") and "| NVIDIA | 젯슨 오린 275 TOPS (NVIDIA 발표) [7] |" in rows
+    old = ["| 구분 | 기업 | 국가 | 제품 | 비교 |", "|---|---|---|---|---|", "| 선도 기업 | Qualcomm | 미국 | X | 점유율 15% |"]
+    assert reporter.comparison_rows(old) == []          # 예전 보고서는 카드에 비교 문장이 있다
+
+
+def test_previous_body_drops_not_comparable_line():
+    body = reporter.insert_competitor_table("## 5. 경쟁 구도\n{{COMPETITOR_TABLE}}\n해설.\n", CHECKED, CHECKED_SOURCES)
+    prev = reporter.previous_body({"report": body + "\n## REFERENCE\n"}, [])
+    assert reporter.NOT_COMPARABLE_PREFIX not in prev and "해설." in prev
+
+
 def test_key_name_citations_are_removed():
     assert reporter.KEY_CITATION_PATTERN.sub("", "정보는 확인되지 않는다[team_analysis].") == "정보는 확인되지 않는다."
     assert reporter.KEY_CITATION_PATTERN.sub("", "근거[3].") == "근거[3]."
@@ -322,11 +356,11 @@ def test_reporter_node_rewrites_only_flagged_chapter():
     assert "원래 개요." in report and "원래 한계." in report and "고친 리스크." in report
 
 
-def test_landscape_card_text_is_shortened_to_first_sentence():
+def test_landscape_card_text_is_first_sentence_or_nothing():
     long = ("Snapdragon processors with integrated NPUs for edge AI. Qualcomm has a 15.6% share of the market "
             "and keeps expanding into automotive and PC segments with new chips.")
     assert reporter._short(long, 110) == "Snapdragon processors with integrated NPUs for edge AI."
-    assert reporter._short("가" * 50 + " " + "나" * 80, 110).endswith("…")
+    assert reporter._short("가" * 50 + " " + "나" * 80, 110) == ""            # 중간에 잘라 '…'을 붙이지 않는다
     assert reporter._short("짧은 설명", 110) == "짧은 설명"
 
 
