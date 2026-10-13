@@ -257,13 +257,32 @@ def rework_queries(name: str, product: str, segment: str, focus: list[str]) -> t
     news = [f"{SEGMENT_KEYWORDS.get(segment, 'AI 반도체')} 국내외 업체 경쟁 구도"]
     if "publisher_diversity" in focus:
         news.append(f"{name} 경쟁 제품 비교 평가")
+    if "comparison_evidence" in focus:   # 확인된 비교 주장이 없을 때: 성능·전력 수치와 제3자 벤치마크를 찾는다
+        general.append(f"{subject} TOPS power efficiency benchmark specifications")
+        news.append(f"{name} {subject} 성능 전력 효율 수치")
     return general, news
 
 
-def _merge_previous(prev: dict, new: dict) -> dict:
+def _merge_competitors(prev: list[dict], new: list[dict], target: str) -> list[dict]:
+    """같은 경쟁사는 하나로 두고 주장을 합친다. (경쟁사 단위로 합치면 재작업에서 찾은 비교 주장이 버려졌다)"""
+    merged: dict[str, dict] = {}
+    for c in [*prev, *new]:
+        key = _norm(c["name"])
+        if key not in merged:
+            merged[key] = {**c, **({"claims": list(c["claims"])} if "claims" in c else {})}
+            continue
+        kept = merged[key]
+        if "claims" in c:
+            kept["claims"] = union(kept.get("claims") or [], c["claims"], key=lambda x: _compact(x["text"]))
+            kept["comparison"] = " ".join(claim_text(x, target, kept["name"]) for x in kept["claims"]) or NO_COMPARISON
+        kept["summary"] = kept.get("summary") or c.get("summary", "")
+    return list(merged.values())
+
+
+def _merge_previous(prev: dict, new: dict, target: str = "") -> dict:
     """재작업 전에 확인한 경쟁사·차별점·리스크는 유지하고 새로 찾은 것만 더한다."""
     merged = dict(new)
-    merged["competitors"] = union(prev.get("competitors") or [], new.get("competitors") or [], key=lambda x: _norm(x["name"]))
+    merged["competitors"] = _merge_competitors(prev.get("competitors") or [], new.get("competitors") or [], target)
     merged["differentiation"] = union(prev.get("differentiation") or [], new.get("differentiation") or [],
                                       key=lambda x: _compact(x["text"] if isinstance(x, dict) else x))
     merged["competitive_risks"] = union(prev.get("competitive_risks") or [], new.get("competitive_risks") or [])
@@ -336,7 +355,7 @@ def competitor_node(state: dict) -> dict:
     analysis = _strip_refs(analysis)
     prev = previous(state, "competitor_analysis") if rework else None
     if prev:
-        analysis = _merge_previous(prev, analysis)
+        analysis = _merge_previous(prev, analysis, name)
     return {
         "competitor_analysis": analysis,
         "sources": [to_source(r, name, "competitor") for r in used],

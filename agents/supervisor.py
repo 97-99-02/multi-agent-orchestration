@@ -77,6 +77,12 @@ def single_day_web(sources: list[dict], company: str, node: str) -> str:
     return days[0] if len(days) >= MIN_WEB_FOR_DATE_CHECK and len(set(days)) == 1 else ""
 
 
+def verified_comparisons(analysis: dict) -> int:
+    """경쟁사 분석이 원문과 대조해 남긴 비교 주장 수. 경쟁사 에이전트가 의견과 숫자·연도가 원문에 없는 주장을
+    이미 버렸으므로, 남은 주장은 근거 출처가 실제로 뒷받침하는 수치·사실이다."""
+    return sum(len(c.get("claims") or []) for c in analysis.get("competitors") or [])
+
+
 def check_evidence(node: str, analysis: dict, sources: list[dict], company: str) -> dict:
     """관점 하나의 근거 충분성. {"sufficient", "reason", "focus"}를 돌려준다.
     focus는 재작업 때 해당 에이전트가 무엇을 보완할지 읽는 값이다.
@@ -102,6 +108,10 @@ def check_evidence(node: str, analysis: dict, sources: list[dict], company: str)
         if not analysis.get("competitors"):
             reasons.append("같은 세부 분야 경쟁사 없음")
             focus.append("english_keywords")
+        elif not verified_comparisons(analysis):
+            # 경쟁사 수·출처 수만 채우고 비교 근거가 하나도 없으면 완료로 보지 않는다 (재작업 후에도 없으면 정보 부족으로 진행)
+            reasons.append("원문으로 확인된 경쟁사 비교 주장 없음")
+            focus.append("comparison_evidence")
 
     if not analysis.get("failed"):
         pubs = publishers_of(sources, company, node)
@@ -126,7 +136,7 @@ RESEARCH_FOCUS = {
     "tech_summary": ["development_stage", "performance_metrics", "public_revenue_contracts", "publisher_diversity"],
     "market": ["upper_segment"],
     "team": ["alternative_queries", "publisher_diversity"],
-    "competitor": ["english_keywords", "publisher_diversity"],
+    "competitor": ["comparison_evidence", "publisher_diversity"],
 }
 
 
