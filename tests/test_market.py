@@ -86,3 +86,19 @@ def test_extract_drops_unitless_and_unsourced(monkeypatch):
     _, out = market.extract("모빌린트", "엣지", [Document(page_content=SUMMARY_CHUNK + "\n155", metadata={})])
     assert [f["value"] for f in out] == ["592억 달러"]
     assert out[0]["segment_specific"]
+
+
+# ---------- 하위 시장 수치 (세부 분야 전체 수치로 채점, 하위 시장은 참고) ----------
+def test_pc_figure_is_sub_market_of_edge():
+    assert market.is_sub_market("PC용 AI 반도체", "엣지")
+    assert market.is_sub_market("엣지디바이스 분야 PC용 AI반도체", "엣지")      # 분야 이름이 함께 있어도 하위 시장
+    assert not market.is_sub_market("온디바이스용 AI반도체 시장", "엣지")
+    assert not market.is_sub_market("데이터센터용 AI반도체", "데이터센터")       # 하위 시장 용어가 없는 분야
+
+
+def test_sub_market_figures_alone_are_not_sufficient():
+    wide = {"kind": "시장규모", "segment_specific": True, "sub_market": False}
+    pc_growth = {"kind": "성장률", "segment_specific": True, "sub_market": True}
+    wide_growth = {"kind": "성장률", "segment_specific": True, "sub_market": False}
+    assert not market.is_sufficient([wide, pc_growth])
+    assert market.is_sufficient([wide, pc_growth, wide_growth])

@@ -42,10 +42,17 @@ REWORK_QUERIES = {
 # (LLM에게 판정을 맡기면 데이터센터 수치를 '차량용'으로 바꿔 적는 오류가 있었다)
 SEGMENT_TERMS = {
     "데이터센터": ("데이터센터", "서버", "클라우드", "하이퍼스케일"),
-    "엣지": ("온디바이스", "엣지", "on-device", "pc", "스마트폰", "모바일", "로봇"),
+    "엣지": ("온디바이스", "엣지", "on-device"),
     "차량용": ("차량", "자율주행", "자동차", "모빌리티", "adas"),
     "인프라": ("hbm", "cxl", "hbf", "메모리", "인터커넥트"),
     "기타": ("ai반도체",),
+}
+
+# 세부 분야 안의 하위 시장 용어. 이 용어가 scope에 있는 수치는 하위 시장 수치(sub_market)로 표시하고
+# 채점(3~5점) 근거로는 쓰지 않는다. 보고서에는 참고 수치로만 적는다
+# (예: 엣지 기업에 'PC용 AI 반도체' 성장률 62.8%를 적용하면 분야 전체 16%보다 높게 채점됐다)
+SUB_MARKET_TERMS = {
+    "엣지": ("pc", "스마트폰", "모바일", "로봇"),
 }
 
 # 프롬프트에 넣을 분야 이름. '기타'를 그대로 넣으면 차트 범례의 '기타' 항목을 대상 분야로 착각한다
@@ -133,7 +140,14 @@ def is_segment_specific(scope: str, text: str, segment: str) -> bool:
         others = (t for seg, terms in SEGMENT_TERMS.items() if seg != "기타" for t in terms)
         if any(t in scope for t in others):
             return False
-    return any(t in scope and t in body for t in SEGMENT_TERMS.get(segment, SEGMENT_TERMS["기타"]))
+    terms = SEGMENT_TERMS.get(segment, SEGMENT_TERMS["기타"]) + SUB_MARKET_TERMS.get(segment, ())
+    return any(t in scope and t in body for t in terms)
+
+
+def is_sub_market(scope: str, segment: str) -> bool:
+    """scope가 세부 분야 안의 하위 시장(PC·스마트폰 등)을 가리키면 True. 분야 이름이 함께 있어도 하위 시장으로 본다."""
+    scope = _compact(scope).lower()
+    return any(t in scope for t in SUB_MARKET_TERMS.get(segment, ()))
 
 
 def extract(name: str, segment: str, docs: list) -> tuple[MarketAnalysis, list[dict]]:
@@ -151,6 +165,7 @@ def extract(name: str, segment: str, docs: list) -> tuple[MarketAnalysis, list[d
         figures.append({
             **f.model_dump(),
             "segment_specific": is_segment_specific(f.scope, d.page_content, segment),
+            "sub_market": is_sub_market(f.scope, segment),
             "source": f"{d.metadata.get('title', '')} p.{d.metadata.get('page', '')}",
         })
     return a, figures
@@ -158,7 +173,7 @@ def extract(name: str, segment: str, docs: list) -> tuple[MarketAnalysis, list[d
 
 def is_sufficient(figures: list[dict]) -> bool:
     """채점 기준(설계 3.3)에 필요한 세부 분야 시장 규모와 성장률이 모두 있는가."""
-    kinds = {f["kind"] for f in figures if f["segment_specific"]}
+    kinds = {f["kind"] for f in figures if f["segment_specific"] and not f.get("sub_market")}   # 하위 시장 수치만으로는 부족
     return {"시장규모", "성장률"} <= kinds
 
 
