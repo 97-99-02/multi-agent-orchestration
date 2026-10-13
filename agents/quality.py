@@ -21,10 +21,12 @@ import json
 import logging
 import os
 import re
+from typing import Literal
 
 from pydantic import BaseModel, Field
 
 from agents.reporter import REFERENCE_HEADING, printed_reference_numbers
+from agents.supervisor import evidence_report
 from agents.verifier import _evidence_json, check_citations, find_wording_problems
 from config import (LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MAX_QUALITY_LOOPS, MODEL_JUDGE, QUALITY_CITED_RATIO,
                     QUALITY_MAX_SAME_DAY_SHARE, QUALITY_MAX_SOURCE_SHARE, QUALITY_MAX_UNVERIFIED,
@@ -206,10 +208,17 @@ class JudgeItem(BaseModel):
     reasons: list[str] = Field(description="미달이면 보고서의 어느 문장이 왜 문제인지 구체적으로. 통과면 빈 목록")
 
 
+class EvidenceGap(BaseModel):
+    perspective: Literal["tech_summary", "market", "competitor", "team"]
+    reason: str = Field(description="보고서를 고쳐 써서는 해결되지 않는 이유 (자료 자체에 근거가 없거나 한쪽 출처뿐)")
+
+
 class QualityJudgement(BaseModel):
     groundedness: JudgeItem = Field(description="본문 주장(특히 수치·사실)이 인용한 출처와 분석 자료로 뒷받침되는가")
     neutrality: JudgeItem = Field(description="투자/보류 결정을 기준표 점수로만 설명하고, 리스크를 축소하거나 경쟁사를 깎아내리지 않는가")
     bias_control: JudgeItem = Field(description="분석 자료에 있는 약점·리스크·반대 근거를 빼고 유리한 근거만 쓰지 않았는가")
+    evidence_gaps: list[EvidenceGap] = Field(default_factory=list,
+                                             description="미달 원인이 문장이 아니라 분석 자료의 근거 부족인 관점. 없으면 빈 목록")
 
 
 JUDGE_PROMPT = """너는 투자 평가 보고서의 품질 검토자다. 아래 [분석 자료]만 근거로 [보고서]를 3개 항목별로 판정하라.
@@ -222,6 +231,8 @@ JUDGE_PROMPT = """너는 투자 평가 보고서의 품질 검토자다. 아래 
   수치 근거 없는 회사 홍보 문구(보도자료 어투)를 사실처럼 옮김
 - bias_control: [분석 자료]에 있는 약점·리스크·반대 근거를 보고서에서 뺌, 또는 한 발표를 옮긴 기사들에만 기댐
 자료에 없는 내용을 없다고 밝힌 것은 미달 사유가 아니다.
+미달 원인이 보고서 문장이 아니라 [분석 자료] 자체에 근거가 없거나 한 발표·한 출처뿐인 것이면, 그 관점
+(tech_summary, market, competitor, team)과 이유를 evidence_gaps에 적는다. 다시 써서 고칠 수 있는 표현 문제는 넣지 않는다.
 {mode_note}
 
 [분석 자료 - JSON]
@@ -267,6 +278,21 @@ def add_quality_note(report: str, items: dict) -> str:
     return head.rstrip() + "\n\n" + note + "\n\n" + sep + tail
 
 
+def evidence_gaps(code: dict, judgement, state: dict) -> dict[str, str]:
+    """다시 써서는 해결되지 않는 근거 부족 관점 {관점: 이유}. supervisor가 이 관점을 다시 조사한다.
+    코드: 편향 통제가 출처 수·같은 날 보도로 미달이면, 관점별 충분성 판정에서 같은 문제가 있는 관점.
+    Judge: evidence_gaps로 짚은 관점.
+    """
+    gaps = {}
+    if any(("발행처" in r or "같은 날" in r) for r in code["bias_control"]):
+        for node, status in evidence_report(state).items():
+            if "publisher_diversity" in status["focus"]:
+                gaps[node] = status["reason"]
+    for gap in (judgement.evidence_gaps if judgement else []):
+        gaps.setdefault(gap.perspective, gap.reason)
+    return gaps
+
+
 def fix_instructions(items: dict) -> str:
     lines = [f"- [{ITEM_LABELS[k]}] {r}" for k in ITEMS for r in items[k]["reasons"] if not items[k]["passed"]]
     return "\n".join(lines)
@@ -290,17 +316,18 @@ def quality_eval_node(state: dict, judge_llm=None) -> dict:
         items[k] = {"passed": not code[k] and (verdict is None or verdict.passed), "reasons": reasons,
                     "code_passed": not code[k], "judge_passed": None if verdict is None else verdict.passed}
     passed = all(v["passed"] for v in items.values())
+    gaps = evidence_gaps(code, judgement, state) if not passed and is_recommend(state) else {}
     # 회차마다 미달 사유를 결정 로그에 남긴다 (보고서에는 마지막 회차 사유만 남으므로)
     log_event(state.get("trace_id"), "quality", "quality_eval", report_version=state.get("report_version"),
               passed=passed, failed={k: v["reasons"] for k, v in items.items() if not v["passed"]},
-              judge_ran=judgement is not None)
+              judge_ran=judgement is not None, evidence_gaps=gaps)
     logger.info("[품질 평가] v%s %s: %s", state.get("report_version"), "통과" if passed else "미달",
                 {k: v["passed"] for k, v in items.items()})
     out = {"eval_result": {
         "passed": passed, "report_version": state.get("report_version"),
         "mode": "recommend" if is_recommend(state) else "no_recommend",
         "items": items, "fix_instructions": fix_instructions(items),
-        "judge_ran": judgement is not None, "judge_error": judge_error,
+        "judge_ran": judgement is not None, "judge_error": judge_error, "evidence_gaps": gaps,
     }}
     # 재작성 한도에 도달한 미달이면 supervisor가 종료하므로, 미달 항목을 보고서 한계점에 남긴다 (verifier의 '확인 필요'와 같은 방식)
     if not passed and state.get("quality_loops", 0) >= MAX_QUALITY_LOOPS:

@@ -21,13 +21,15 @@ def tmp_log_dir(tmp_path, monkeypatch):
 
 
 class Scenario:
-    def __init__(self, candidates, decisions, eligible=None, tech_gap=False, verify=None, quality=None):
+    def __init__(self, candidates, decisions, eligible=None, tech_gap=False, verify=None, quality=None, gaps=None):
         self.candidates = candidates
-        self.decisions = decisions              # {기업: "투자"|"보류"}
+        self.decisions = {k: [v] if isinstance(v, str) else list(v) for k, v in decisions.items()}
+        # {기업: "투자"|"보류"} 또는 판단 차례별 목록 {기업: ["투자", "보류"]} (재판단에서 바뀌는 경우)
         self.eligible = eligible or {}          # {기업: False} 이면 조건 미충족
         self.tech_gap = tech_gap                # 첫 기술 요약에서 개발 단계가 빔 → 재작업 후 채워짐
         self.verify = list(verify or [])        # 사실 검증 통과 여부를 차례로
         self.quality = list(quality or [])      # 품질 평가 통과 여부를 차례로
+        self.gaps = list(gaps or [])            # 품질 평가가 짚는 근거 부족 관점 {관점: 이유}를 차례로
         self.calls = []
 
     def _name(self, state):
@@ -63,7 +65,8 @@ class Scenario:
         def judge(state):
             self.calls.append("judge")
             name = self._name(state)
-            decision = self.decisions[name]
+            queue = self.decisions[name]
+            decision = queue.pop(0) if len(queue) > 1 else queue[0]
             out = {"scores": {"decision": decision, "total": 78 if decision == "투자" else 60}}
             if decision == "보류":
                 out["rejected"] = [{"company": name, "reason": "70점 미만", "total": 60}]
@@ -83,8 +86,10 @@ class Scenario:
         def quality(state):
             self.calls.append("quality_eval")
             passed = self.quality.pop(0) if self.quality else True
+            gaps = self.gaps.pop(0) if self.gaps else {}
             return {"eval_result": {"passed": passed, "report_version": state.get("report_version"),
-                                    "items": {"bias_control": {"passed": passed, "reasons": []}}, "fix_instructions": ""}}
+                                    "items": {"bias_control": {"passed": passed, "reasons": []}}, "fix_instructions": "",
+                                    "evidence_gaps": gaps}}
 
         return {
             "explorer": explorer,
@@ -210,3 +215,25 @@ def test_fake_workers_never_write_control_keys():
         if name == "judge":
             continue
         assert not set(fn(state)) & CONTROL_KEYS, name
+
+
+
+# ---------- 근거 부족 → 관점 재조사 (2차 피드백 B단계) ----------
+def test_quality_evidence_gap_reopens_research_then_rejudges_and_rewrites():
+    s = Scenario(["A사"], {"A사": "투자"}, quality=[False, True], gaps=[{"team": "한 발표를 옮긴 기사뿐"}])
+    out = s.run()
+    routes = [set(d) if isinstance(d, list) else d for d in decisions()]
+    assert routes[-7:] == [{"quality_eval"}, {"team"}, {"judge"}, {"reporter"}, {"verifier"}, {"quality_eval"}, "END"]
+    assert out["research_loops"] == 1 and out["quality_loops"] == 1 and out["report_version"] == 2
+    assert out["reopen_stage"] is None
+
+
+def test_rejudge_hold_after_research_moves_to_next_candidate():
+    s = Scenario(["A사", "B사"], {"A사": ["투자", "보류"], "B사": "투자"}, quality=[False, True],
+                 gaps=[{"market": "세부 분야 수치 없음"}])
+    out = s.run()
+    routes = [set(d) if isinstance(d, list) else d for d in decisions()]
+    assert {"market"} in routes and routes[routes.index({"market"}) + 1:routes.index({"market"}) + 3] == [{"judge"}, {"explorer"}]
+    assert out["company"]["name"] == "B사" and out["report"] == f"보고서 v{out['report_version']}"
+    assert [r["company"] for r in out["rejected"]] == ["A사"]
+    assert out["research_loops"] == 0                 # 다음 기업으로 넘어가며 기업 단위 횟수 초기화

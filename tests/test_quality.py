@@ -116,8 +116,8 @@ def test_no_recommend_report_skips_company_level_checks():
 
 # ---------- LLM Judge (Hybrid) ----------
 class FakeJudge:
-    def __init__(self, fail=(), error=None):
-        self.fail, self.error, self.prompts = set(fail), error, []
+    def __init__(self, fail=(), error=None, gaps=()):
+        self.fail, self.error, self.prompts, self.gaps = set(fail), error, [], list(gaps)
 
     def with_structured_output(self, schema):
         return self
@@ -131,7 +131,8 @@ class FakeJudge:
             raise self.error
         return q.QualityJudgement(**{k: q.JudgeItem(passed=k not in self.fail,
                                                     reasons=["자료의 양산 지연 리스크가 빠짐"] if k in self.fail else [])
-                                     for k in q.ITEMS})
+                                     for k in q.ITEMS},
+                                  evidence_gaps=[q.EvidenceGap(perspective=p, reason="공개 자료 없음") for p in self.gaps])
 
 
 def test_judge_failure_fails_item_even_if_code_passes():
@@ -208,3 +209,23 @@ def test_internal_field_names_fail_groundedness():
 def test_best_level_phrase_is_marketing():
     result = node(make_report(summary="## SUMMARY\n국내 최고 수준의 기술력.\n"))
     assert any("'최고 수준'" in r for r in result["items"]["neutrality"]["reasons"])
+
+
+
+# ---------- 근거 부족 관점 (B단계) ----------
+def test_judge_evidence_gaps_are_returned_only_when_failed():
+    result = node(make_report(), judge_llm=FakeJudge(fail={"bias_control"}, gaps=["market"]))
+    assert result["evidence_gaps"] == {"market": "공개 자료 없음"}
+    passed = node(make_report(), judge_llm=FakeJudge(gaps=["market"]))
+    assert passed["passed"] and passed["evidence_gaps"] == {}
+
+
+def test_same_day_bias_maps_to_perspective_with_same_day_sources():
+    refs = ("## REFERENCE\n### 기관 보고서\n- [1] KDB(2024). 동향.\n- [2] ETRI(2026). 동향.\n### 웹페이지\n"
+            "- [3] 전자신문(2026-08-19). 시리즈A. etnews.com\n- [4] 매일경제(2026-08-19). 시리즈A. mk.co.kr\n"
+            "- [5] 뉴스1(2026-08-19). 시리즈A. news1.kr\n- [6] 더벨(2026-01-15). 기사. thebell.co.kr\n")
+    same_day = [{"company": "A사", "node": "team", "kind": "web", "publisher": p, "date": "2026-08-19"}
+                for p in ("etnews", "mk")]
+    state = {**INVEST, "sources": same_day, "team_analysis": {"members": [{"name": "홍길동"}], "concerns": []}}
+    result = node(make_report(reference=refs), state=state)
+    assert "team" in result["evidence_gaps"] and "같은 날" in result["evidence_gaps"]["team"]
