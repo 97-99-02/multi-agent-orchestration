@@ -55,6 +55,9 @@ INTERNAL_NAMES = ("core_chips", "development_stage", "performance_metrics", "pub
                   "team_analysis", "summary_caution", "info_insufficient", "industry_context", "sub_market",
                   "segment_specific", "sources_for_citation", "evaluation_rules")
 SUMMARY_EVIDENCE_LABEL = "**핵심 근거**"
+SUMMARY_RISK_LABEL = "**핵심 리스크**"
+# '정보 부족으로 점수가 제한되었다' 같은 서술. 정보 부족으로 채점된 항목이 없으면 채점 결과와 모순이다
+INSUFFICIENT_CLAIM = re.compile(r"정보\s*부족[^.\n]{0,40}?(?:점수|채점|평가)[^.\n]{0,15}?(?:제한|낮아|낮게|하향)")
 
 CITATION = re.compile(r"\[(\d+)\]")
 REFERENCE_LINE = re.compile(r"^- \[(\d+)\] ([^(\n]+?)\(([^)]*)\)", re.MULTILINE)
@@ -128,14 +131,16 @@ def check_groundedness(report: str, recommend: bool) -> list[str]:
         if competition and not CITATION.search(competition[0]):
             reasons.append("경쟁 구도 장에 인용 없음 (경쟁사 수치의 출처를 확인할 수 없음)")
     if recommend:
-        # SUMMARY 핵심 근거: 수치·사실을 담은 줄마다 출처 번호 (분석 장 문단 검사에 안 걸리는 부분)
+        # SUMMARY 핵심 근거·핵심 리스크: 줄마다 출처 번호 (분석 장 문단 검사에 안 걸리는 부분)
         summary = next((t for h, t in sections(body) if "SUMMARY" in h.upper()), "")
-        if SUMMARY_EVIDENCE_LABEL in summary:
-            block = summary.split(SUMMARY_EVIDENCE_LABEL, 1)[1].split("**", 1)[0]
+        for label in (SUMMARY_EVIDENCE_LABEL, SUMMARY_RISK_LABEL):
+            if label not in summary:
+                continue
+            block = summary.split(label, 1)[1].split("**", 1)[0]
             bullets = [ln for ln in block.splitlines() if ln.strip().startswith(("-", "*", "•"))]
             uncited = [b for b in bullets if not CITATION.search(b)]
             if uncited:
-                reasons.append(f"SUMMARY 핵심 근거 {len(bullets)}개 중 {len(uncited)}개에 출처 번호 없음")
+                reasons.append(f"SUMMARY {label.strip('*')} {len(bullets)}개 중 {len(uncited)}개에 출처 번호 없음")
     exposed = [w for w in INTERNAL_NAMES if re.search(rf"(?<![A-Za-z_]){w}(?![A-Za-z_])", body)]
     exposed += [w for w in ("weaknesses", "strengths")   # 일반 단어이기도 해서 필드명처럼 쓰인 경우만
                 if re.search(rf"(?<![A-Za-z_]){w}(?=['’\"]|\s*[가-힣])", body)]
@@ -145,6 +150,16 @@ def check_groundedness(report: str, recommend: bool) -> list[str]:
     if marks > QUALITY_MAX_UNVERIFIED:
         reasons.append(f"사실 검증에서 확인되지 않은 표현 {marks}곳 (허용 {QUALITY_MAX_UNVERIFIED})")
     return reasons
+
+
+def check_score_statements(report: str, state: dict) -> list[str]:
+    """본문이 '정보 부족으로 점수가 제한되었다'고 쓰는데 정보 부족으로 채점된 항목이 없으면 채점 결과와 모순이다."""
+    body, _ = split_report(report)
+    items = (state.get("scores") or {}).get("items") or {}
+    m = INSUFFICIENT_CLAIM.search(body)
+    if m and items and not any(v.get("insufficient") for v in items.values() if isinstance(v, dict)):
+        return [f"'{m.group(0)}'라고 썼지만 정보 부족으로 채점된 항목이 없음 (채점 결과와 다름)"]
+    return []
 
 
 def check_neutrality(report: str, state: dict) -> list[str]:
@@ -196,7 +211,7 @@ def check_bias(report: str, recommend: bool) -> list[str]:
 def code_checks(report: str, state: dict) -> dict[str, list[str]]:
     recommend = is_recommend(state)
     return {
-        "groundedness": check_groundedness(report, recommend),
+        "groundedness": check_groundedness(report, recommend) + check_score_statements(report, state),
         "neutrality": check_neutrality(report, state),
         "bias_control": check_bias(report, recommend),
     }
@@ -216,7 +231,7 @@ class EvidenceGap(BaseModel):
 
 
 class QualityJudgement(BaseModel):
-    groundedness: JudgeItem = Field(description="본문 주장(특히 수치·사실)이 인용한 출처와 분석 자료로 뒷받침되는가")
+    groundedness: JudgeItem = Field(description="본문 주장(수치·사실·결론)이 인용한 출처와 분석 자료로 뒷받침되고, 회사 발언을 제3자 평가처럼 쓰지 않았는가")
     neutrality: JudgeItem = Field(description="투자/보류 결정을 기준표 점수로만 설명하고, 리스크를 축소하거나 경쟁사를 깎아내리지 않는가")
     bias_control: JudgeItem = Field(description="분석 자료에 있는 약점·리스크·반대 근거를 빼고 유리한 근거만 쓰지 않았는가")
     evidence_gaps: list[EvidenceGap] = Field(default_factory=list,
@@ -229,7 +244,10 @@ JUDGE_PROMPT = """너는 투자 평가 보고서의 품질 검토자다. 아래 
 미달은 아래처럼 내용에 문제가 있을 때만 판정한다. 표현·용어 선택·문체·분량은 미달 사유가 아니다.
 - groundedness: 보고서의 사실·수치가 [분석 자료]나 인용한 출처와 다르거나, 자료에 없는 사실을 단정함,
   또는 같은 사실(양산·테이프아웃 시점, 수치 등)을 장마다 다른 값·시점으로 씀,
-  또는 문장에 붙은 출처 번호의 [인용 출처 원문]이 그 문장을 뒷받침하지 않음 (다른 출처를 잘못 붙임)
+  또는 문장에 붙은 출처 번호의 [인용 출처 원문]이 그 문장을 뒷받침하지 않음 (다른 출처를 잘못 붙임, 리스크 문장 포함),
+  또는 회사(대표 인터뷰·보도자료)가 한 말을 '평가된다'·'인정받는다'처럼 제3자 평가나 확인된 사실로 씀
+  (경쟁사 분석의 speaker가 대상 기업·경쟁사인 내용),
+  또는 원문의 전망·가능성·계획·MOU를 단정하거나 완료로 씀 (원문보다 강한 결론)
 - neutrality: 점수·기준표가 아닌 근거로 결정을 정당화하거나, 리스크를 축소하거나, 경쟁사를 깎아내리거나,
   수치 근거 없는 회사 홍보 문구(보도자료 어투)를 사실처럼 옮김
 - bias_control: [분석 자료]에 있는 약점·리스크·반대 근거를 보고서에서 뺌, 또는 한 발표를 옮긴 기사들에만 기댐

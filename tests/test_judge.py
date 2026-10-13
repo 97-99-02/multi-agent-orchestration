@@ -384,3 +384,14 @@ def test_deal_capped_when_only_financial_investors():
 def test_judge_prompt_rules_for_claims_and_strategic_investors():
     assert "comparable=false인 수치는 우위 근거가 아니고" in judge.PROMPT
     assert "은행·보험·증권·캐피탈·VC·정책금융기관은" in judge.PROMPT
+
+
+def test_risks_without_sources_are_dropped():
+    # 출처 없는 일반론 리스크('자금 소진 속도')에 보고서가 관계없는 출처를 붙였었다
+    c = card()
+    c.risks = [judge.Risk(category="시장", description="경쟁 심화", source_ids=[0]),
+               judge.Risk(category="운영", description="자금 소진 속도가 빠를 수 있음")]
+    risks = judge.score_card(c, STATE, judge.company_sources(STATE))["risks"]
+    assert risks == [{"category": "시장", "description": "경쟁 심화", "sources": [{"title": "기사", "url": "http://x"}]}]
+    assert "source_ids에 넣는다" in judge.PROMPT
+

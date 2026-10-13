@@ -77,6 +77,7 @@ class LegalRisk(BaseModel):
 class Risk(BaseModel):
     category: Literal["시장", "기술", "규제", "경쟁", "운영"]
     description: str = Field(description="리스크 한 문장 (분석 자료에 근거)")
+    source_ids: list[int] = Field(default_factory=list, description="이 리스크를 다룬 출처 번호 (출처 목록의 번호)")
 
 
 class Scorecard(BaseModel):
@@ -106,7 +107,8 @@ PROMPT = """너는 AI 반도체 VC의 투자 심사역이다. '{name}'을 아래
 7. 법률 리스크(legal_risk): 핵심 기술 관련 소송·분쟁이 자료에 있으면 사업 지속에 영향을 주는지 자료로 판단하고, 판단 근거를 evidence에 쓴다.
    소송이 있어도 사업 영향이 없다거나 이미 해소됐다는 출처가 있으면 그 근거를 쓰고 unresolved=false다.
    그런 출처가 없으면 unresolved=true다. 소송·분쟁이 자료에 없으면 unresolved=false다. 판단에 쓴 출처 번호는 source_ids에 넣는다.
-8. risks에는 투자 시 고려할 시장·기술·규제·경쟁·운영 리스크를 분석 자료에서 골라 쓴다.
+8. risks에는 투자 시 고려할 시장·기술·규제·경쟁·운영 리스크를 분석 자료에서 골라 쓰고, 그 리스크를 다룬 출처 번호를
+   source_ids에 넣는다. 출처가 다루지 않는 일반론(예: 자금 소진 가능성)은 쓰지 않는다.
 9. 계획·예정·목표·추진 중인 일은 달성한 것으로 인정하지 않는다. 테이프아웃 완료 예정은 테이프아웃 완료가 아니고,
    양산 예정·목표는 양산 시작이 아니며, 계약 논의·협의 중은 계약 체결이 아니다. 완료가 확인된 사실만 해당 점수 조건으로 본다.
 10. tech_summary의 기존 7개 항목과 evidence는 기업 웹 사실이고, industry_context는 보고서 기반 업계 해석이다.
@@ -415,7 +417,9 @@ def score_card(card: Scorecard, state: dict, sources: list[dict]) -> dict:
             "evidence": card.legal_risk.evidence,
             "sources": legal_sources,
         },
-        "risks": [r.model_dump() for r in card.risks],
+        # 출처가 없는 리스크는 뺀다. 출처 칸이 없을 때 보고서가 리스크에 관계없는 출처 번호를 붙였다 (운영 리스크에 투자 유치 기사)
+        "risks": [{"category": r.category, "description": r.description, "sources": cite(r.source_ids, sources)}
+                  for r in card.risks if cite(r.source_ids, sources)],
         "total": total,
         "decision": decision,
         "hold_reasons": hold_reasons,
