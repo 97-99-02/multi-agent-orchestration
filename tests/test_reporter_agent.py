@@ -7,6 +7,8 @@
 """
 from types import SimpleNamespace
 
+import pytest
+
 from agents import quality, reporter, verifier
 from config import MAX_QUALITY_LOOPS
 
@@ -147,6 +149,26 @@ def test_short_report_is_typeset_with_larger_spacing(tmp_path, monkeypatch):
     _, base = reporter.export_report_pdf(SHORT, output_dir=tmp_path, filename="base.pdf")
     assert scaled >= base
     assert reporter._LAYOUT_SCALE == 1.0          # 조판이 끝나면 배율을 되돌린다
+
+
+@pytest.mark.parametrize("trials, chosen", [
+    # 최소 쪽수를 채운 배율 중 마지막 쪽이 30% 이상 찬 가장 작은 배율 (x1.3은 7쪽이지만 마지막 쪽 2%)
+    ([(1.0, 6, 0.2), (1.2, 6, 0.83), (1.3, 7, 0.02), (1.6, 7, 0.44)], 1.6),
+    ([(1.0, 7, 0.05), (1.1, 8, 0.5)], 1.1),                 # 7쪽이어도 마지막 쪽이 거의 비면 배율을 더 키운다
+    ([(1.0, 5, 1.0), (1.5, 6, 0.97), (1.6, 7, 0.11)], 1.6),  # 최소 쪽수를 채우는 배율이 하나뿐이면 그것
+    ([(1.0, 5, 0.9), (1.1, 6, 0.2), (1.2, 6, 0.8)], 1.2),    # 최소 쪽수에 못 미치면 쪽수 많고 마지막 쪽이 찬 것
+    ([(1.0, 11, 0.5)], 1.0),
+])
+def test_layout_scale_avoids_nearly_empty_last_page(trials, chosen):
+    assert reporter.choose_layout_scale(trials) == chosen
+
+
+def test_end_marker_measures_room_left_on_last_page(tmp_path):
+    from reportlab.platypus import SimpleDocTemplate, Spacer
+    sink = {}
+    doc = SimpleDocTemplate(str(tmp_path / "m.pdf"), pagesize=reporter.A4, topMargin=50, bottomMargin=50)
+    doc.build([Spacer(1, 300), reporter._EndMarker(sink)])
+    assert abs(sink["left"] - (reporter.A4[1] - 100 - 12 - 300)) < 1     # 프레임 높이 - 위아래 여백 6pt씩 - 300
 
 
 def test_body_starts_on_new_page_only_when_first_page_is_full(tmp_path):

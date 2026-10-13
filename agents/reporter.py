@@ -37,8 +37,8 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase.ttfonts import TTFError, TTFont
-from reportlab.platypus import (CondPageBreak, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table,
-                                TableStyle)
+from reportlab.platypus import (CondPageBreak, Flowable, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer,
+                                Table, TableStyle)
 from reportlab.platypus.doctemplate import LayoutError
 
 from agents.competitor import NO_COMPARISON, claim_text
@@ -1140,11 +1140,16 @@ LINE_RATIO = 1.8                               # 줄 간격 (글자 크기 배�
 PARA_GAP, BULLET_GAP = 7, 3                    # 문단·글머리표 뒤 간격(pt)
 SECTION_GAP, HEADING_GAP = 18, 8               # 장 제목 앞·뒤 간격(pt)
 # 이 장들은 쪽에 남은 공간이 PAGE_BREAK_ROOM보다 적으면 새 쪽에서 시작한다 (강제로 넘기면 앞 장의 마지막
-# 한두 줄만 있는 빈 쪽이 생겼다). REFERENCE도 같은 기준. 본문 1장은 항상 새 쪽 (1쪽은 제목 밴드·SUMMARY·대시보드만)
+# 한두 줄만 있는 빈 쪽이 생겼다). 본문 1장은 항상 새 쪽 (1쪽은 제목 밴드·SUMMARY·대시보드만)
 PAGE_BREAK_BEFORE = ("경쟁 구도", "투자 판단 결과")
 PAGE_BREAK_ROOM = 0.3
+# REFERENCE는 제목과 출처 두세 줄이 들어갈 공간만 있으면 이어서 쓴다 (30%면 한계점 뒤 30% 가까이 비고 출처가 다음 쪽으로 밀렸다)
+REFERENCE_ROOM = 0.12
 BODY_START_ROOM = 0.6   # 본문 1장: 쪽에 남은 공간이 60%보다 적으면(=1쪽이 SUMMARY·대시보드로 찼으면) 새 쪽
-LAYOUT_SCALES = (1.0, 1.15, 1.3, 1.45, 1.6)       # MIN_PAGES에 못 미치면 간격 배율을 차례로 키워 다시 조판
+LAYOUT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6)   # MIN_PAGES에 못 미치거나 마지막 쪽이 거의 비면 간격 배율을 키워 다시 조판
+# 마지막 쪽이 이보다 적게 차면 다른 배율을 찾는다. 최소 쪽수를 맞추려고 배율을 키우다 출처 몇 줄만 넘어간 순간 멈춰,
+# 마지막 쪽이 90% 넘게 빈 7쪽짜리가 나왔다
+LAST_PAGE_MIN_FILL = 0.3
 DASH_HEIGHT = 168                              # 대시보드 카드·차트 높이(pt)
 CARD_RATIO = 0.42                              # 대시보드에서 왼쪽 카드가 차지하는 폭 비율
 SCORE_BAR_W, SCORE_BAR_H = 70, 9
@@ -1522,7 +1527,7 @@ def render_blocks(blocks: list[dict], font: str, bold: str, width: float, has_da
             heading, gap = _heading2(title, small, width), Spacer(1, _gap(HEADING_GAP))
             heading.keepWithNext = gap.keepWithNext = True  # 제목만 쪽 끝에 홀로 남지 않게
             # 강제로 새 쪽을 열면 한계점 뒤 검증 결과만 있는 반쪽짜리 쪽이 생겨, 공간이 부족할 때만 넘긴다
-            flow += [CondPageBreak(USABLE_PAGE_HEIGHT * PAGE_BREAK_ROOM), Spacer(1, _gap(SECTION_GAP)), heading, gap]
+            flow += [CondPageBreak(USABLE_PAGE_HEIGHT * REFERENCE_ROOM), Spacer(1, _gap(SECTION_GAP)), heading, gap]
             flow += content_flowables(lines, small, width, font)
         elif level == 2:
             body = content_flowables(lines, normal, width, font)
@@ -1535,8 +1540,8 @@ def render_blocks(blocks: list[dict], font: str, bold: str, width: float, has_da
                 body = text + [f for f in body if f not in text]
             opener = ([CondPageBreak(USABLE_PAGE_HEIGHT * PAGE_BREAK_ROOM)] if any(k in title for k in PAGE_BREAK_BEFORE)
                       else []) + [Spacer(1, _gap(SECTION_GAP))]
-            flow += opener + [KeepTogether([_heading2(title, normal, width), Spacer(1, _gap(HEADING_GAP))] + body[:2])]
-            flow += body[2:]
+            flow += opener + [KeepTogether([_heading2(title, normal, width), Spacer(1, _gap(HEADING_GAP))] + body[:1])]
+            flow += body[1:]
         elif level == 3 and title.startswith(NOTE_TITLE):
             inner = [Paragraph(_inline(title), small["label"])] + content_flowables(lines, small, width - 24, font)
             flow += [Spacer(1, 6), _panel(inner, width, NOTE_BG, MUTED)]
@@ -1824,6 +1829,36 @@ def _page_decorations(font: str, label: str, counter: dict):
 
 
 # ── PDF 저장 ─────────────────────────────────────────────────
+class _EndMarker(Flowable):
+    """맨 끝에 넣어 마지막 쪽에 남은 높이를 잰다. 높이가 0이라 항상 들어가고, wrap이 받는 높이가 그 쪽에 남은 공간이다."""
+
+    def __init__(self, sink: dict):
+        super().__init__()
+        self.sink = sink
+
+    def wrap(self, avail_width, avail_height):
+        self.sink["left"] = avail_height
+        return 0, 0
+
+    def draw(self):
+        pass
+
+
+def choose_layout_scale(trials: list[tuple[float, int, float]]) -> float:
+    """조판해 본 (배율, 쪽수, 마지막 쪽 채움 비율) 중에서 고른다.
+    ① 최소~최대 쪽이고 마지막 쪽이 LAST_PAGE_MIN_FILL 이상 찬 가장 작은 배율
+    ② 없으면 최소~최대 쪽 중 마지막 쪽이 가장 많이 찬 배율
+    ③ 최소 쪽에 못 미치면 최대 쪽 이내에서 쪽수가 가장 많고 마지막 쪽이 가장 많이 찬 배율"""
+    fit = [t for t in trials if MIN_PAGES <= t[1] <= MAX_PAGES]
+    good = [t for t in fit if t[2] >= LAST_PAGE_MIN_FILL]
+    if good:
+        return min(good)[0]
+    if fit:
+        return max(fit, key=lambda t: t[2])[0]
+    within = [t for t in trials if t[1] <= MAX_PAGES] or trials
+    return max(within, key=lambda t: (t[1], t[2]))[0]
+
+
 def export_report_pdf(report: str, output_dir: Path = OUTPUT_DIR, filename: str | None = None,
                       state: dict | None = None, report_date: str | None = None) -> tuple[Path, int]:
     """보고서를 PDF로 저장하고 (저장 경로, 페이지 수)를 돌려준다. MIN_PAGES~MAX_PAGES를 벗어나면 경고한다.
@@ -1868,11 +1903,12 @@ def export_report_pdf(report: str, output_dir: Path = OUTPUT_DIR, filename: str 
     company_name = (state.get("company") or {}).get(COMPANY_NAME_KEY, "") if _is_recommend_mode(state) else ""
     label = " · ".join(v for v in ("AI 스타트업 투자 평가", company_name) if v)
     def build() -> dict:
-        counter = {"n": 0}
+        counter = {"n": 0, "left": 0.0}
         first, later = _page_decorations(font, label, counter)
         doc = SimpleDocTemplate(str(path), pagesize=A4, leftMargin=PAGE_MARGIN, rightMargin=PAGE_MARGIN,
                                 topMargin=PAGE_MARGIN, bottomMargin=PAGE_MARGIN + BOTTOM_EXTRA, title=path.stem)
-        doc.build(make_story(), onFirstPage=first, onLaterPages=later)
+        doc.build(make_story() + [_EndMarker(counter)], onFirstPage=first, onLaterPages=later)
+        counter["fill"] = 1 - counter["left"] / USABLE_PAGE_HEIGHT   # 마지막 쪽이 찬 비율
         return counter
 
     global _PLAIN_FIGURES, _LAYOUT_SCALE
@@ -1889,23 +1925,23 @@ def export_report_pdf(report: str, output_dir: Path = OUTPUT_DIR, filename: str 
             finally:
                 _PLAIN_FIGURES = False
 
-    # 최소 쪽수(MIN_PAGES)에 못 미치면 간격 배율을 키워 다시 조판한다. 최대 쪽수를 넘기 직전 배율에서 멈춘다
+    # 간격 배율을 차례로 키워 조판해 보고, 최소~최대 쪽이면서 마지막 쪽이 충분히 찬 배율을 고른다 (choose_layout_scale)
     try:
-        counter, used = build_once(), LAYOUT_SCALES[0]
-        for scale in LAYOUT_SCALES[1:]:
-            if counter["n"] >= MIN_PAGES:
-                break
+        trials = []
+        for scale in LAYOUT_SCALES:
             _LAYOUT_SCALE = scale
-            trial = build_once()
-            if trial["n"] > MAX_PAGES:
-                _LAYOUT_SCALE = used
-                counter = build_once()   # 넘친 배율 대신 직전 배율로 다시 저장
-                break
-            counter, used = trial, scale
+            counter = build_once()
+            trials.append((scale, counter["n"], counter["fill"]))
+            if counter["n"] > MAX_PAGES or (counter["n"] >= MIN_PAGES and counter["fill"] >= LAST_PAGE_MIN_FILL):
+                break   # 넘쳤거나 조건을 채웠으면 더 키우지 않는다
+        used = choose_layout_scale(trials)
+        if used != trials[-1][0]:
+            _LAYOUT_SCALE = used
+            counter = build_once()   # 고른 배율로 다시 저장 (파일은 마지막으로 조판한 것이 남는다)
     finally:
         _LAYOUT_SCALE = 1.0
-    if used != LAYOUT_SCALES[0]:
-        logger.info("[PDF] 최소 %d장을 맞추려고 간격 배율 %.2f로 조판", MIN_PAGES, used)
+    logger.info("[PDF] 간격 배율 %.2f로 조판 (%d쪽, 마지막 쪽 %.0f%% 참). 시도: %s", used, counter["n"], counter["fill"] * 100,
+                ", ".join(f"x{t[0]:g}={t[1]}쪽/{t[2]:.0%}" for t in trials))
 
     pages = counter["n"]
     if pages < MIN_PAGES:
