@@ -174,7 +174,9 @@ class TechSummaryTests(unittest.TestCase):
         self.write_dummy_result(result)
 
     def write_dummy_result(self, result):
-        output = PROJECT_ROOT / "outputs" / "tech_summary_dummy_result.json"
+        # 기본은 임시 폴더. 결과 예시를 outputs/에 남기려면 WRITE_DUMMY_RESULT=1로 실행
+        base = PROJECT_ROOT / "outputs" if os.environ.get("WRITE_DUMMY_RESULT") == "1" else Path(tempfile.mkdtemp())
+        output = base / "tech_summary_dummy_result.json"
         output.parent.mkdir(parents=True, exist_ok=True)
         output.write_text(json.dumps({
             "notice": "가상 데이터와 모의 LLM 응답으로 만든 테스트 결과입니다. 실제 기업 분석 결과가 아닙니다.",

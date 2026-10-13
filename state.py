@@ -29,10 +29,18 @@ def _source_key(s: Source) -> tuple:
     return (s.get("company"), s.get("node"), s.get("source_id"), s.get("url"), s.get("page"), s.get("snippet"))
 
 
+# 탐색 에이전트가 다음 후보로 넘어갈 때 sources 맨 앞에 넣는 표시. reducer가 이전 기업 출처를 비운다
+# (누적 reducer는 값을 넣으면 더해지기만 해서, 비우려면 표시가 필요하다)
+SOURCES_RESET: Source = {"node": "__reset__"}
+
+
 def merge_sources(old: list[Source], new: list[Source]) -> list[Source]:
     """재작업으로 같은 에이전트가 같은 출처를 다시 넣어도 한 번만 남긴다.
     다른 에이전트가 같은 기사를 쓴 경우(node가 다름)는 지금처럼 둘 다 남긴다.
+    new에 SOURCES_RESET이 있으면 그 앞까지의 출처(이전 기업 것)를 버린다 (후보가 늘어도 State가 쌓이지 않게).
     """
+    if SOURCES_RESET in new:
+        old, new = [], new[len(new) - new[::-1].index(SOURCES_RESET):]
     seen = {_source_key(s) for s in old}
     merged = list(old)
     for s in new:

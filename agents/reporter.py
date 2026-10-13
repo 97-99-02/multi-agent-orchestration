@@ -65,7 +65,7 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
    모두 쓰고, 그중에서 이 기업이 선정되었다는 것을 한 구절로 밝힙니다.
    (예: 후보 A, B, C 중 선정된 B는 환산 점수 76점으로 투자를 추천한다.)
    **핵심 근거**
-   - 근거 (정확히 3개)
+   - 근거 (정확히 3개, 줄마다 끝에 출처 번호)
    **핵심 리스크**
    - 리스크 (정확히 3개)
    **확인 필요**
@@ -111,6 +111,8 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
 19. '사업 리스크' 장의 리스크마다 근거 출처 번호를 붙입니다. (market_risks, competitive_risks, 기술 약점 등 자료에 있는 리스크)
     유리한 근거만 고르지 말고, 자료에 있는 약점·리스크·반대 근거도 해당 장에 씁니다.
 20. [분석 자료]에 halted가 있으면 평가가 중간에 멈춘 것이므로 '한계점' 장 첫 문장에 그 사유를 그대로 씁니다.
+21. 같은 사실(양산·테이프아웃 시점, 성능·투자 수치 등)은 모든 장에서 같은 값·시점으로 씁니다.
+    자료에 시점이 여러 개면 가장 최근 자료의 내용을 쓰고, 계획·목표는 '목표'라고 밝힙니다.
 """
 
 # 투자 추천 기업이 있을 때의 목차
@@ -342,6 +344,20 @@ AGENT_REF_PATTERN = re.compile(r"\s*\[\d{1,3}(?:\s*[,~\-]\s*\d{1,3})*\]")
 KEY_CITATION_PATTERN = re.compile(r"\[[a-z][a-z_]*\]")
 # 자료 이름만 적힌 글머리표 줄 ('- summary_caution 없음' 등)
 KEY_NAME_LINE_PATTERN = re.compile(r"^[ \t]*[-*][ \t]*[a-z]+_[a-z_]*[ \t]*(?:없음)?[ \t]*\n?", re.MULTILINE)
+
+
+# 기술 요약 필드명 → 보고서 표기. LLM이 "'weaknesses' 항목"처럼 필드명을 그대로 쓰는 경우를 고친다
+FIELD_LABELS = {"core_chips": "핵심 칩", "development_stage": "개발 단계", "performance_metrics": "성능 수치",
+                "public_revenue_contracts": "공개 매출·계약", "weaknesses": "약점", "strengths": "강점"}
+# 밑줄이 있는 필드명은 어디서나, 일반 영어 단어이기도 한 weaknesses·strengths는 따옴표 안이거나 바로 뒤에
+# 한글이 올 때만 필드명으로 본다 (경쟁사 표의 영문 설명 속 단어는 그대로 둔다)
+FIELD_NAME_PATTERN = re.compile(
+    r"(?<![A-Za-z_])(core_chips|development_stage|performance_metrics|public_revenue_contracts)(?![A-Za-z_])"
+    r"|(?<![A-Za-z_])(weaknesses|strengths)(?=['’\"]|\s*[가-힣])")
+
+
+def translate_field_names(body: str) -> str:
+    return FIELD_NAME_PATTERN.sub(lambda m: FIELD_LABELS[m.group(1) or m.group(2)], body)
 
 
 def strip_agent_refs(value):
@@ -707,6 +723,7 @@ def assemble_report(state: dict, body: str, sources: list[dict]) -> str:
     body = split_grouped_citations(body)                     # [6,7] → [6][7] (번호 다시 매기기 전에)
     body = KEY_CITATION_PATTERN.sub("", body)                 # [team_analysis] 같은 자료 이름 표기 삭제
     body = KEY_NAME_LINE_PATTERN.sub("", body)                # '- summary_caution 없음' 같은 줄 삭제
+    body = translate_field_names(body)                       # 'weaknesses' 같은 필드명을 한글로
     body = HR_PATTERN.sub("", body)                          # '---' 구분선은 PDF에 글자로 찍히므로 지운다
     if _is_recommend_mode(state):
         body = insert_score_table(body, state["scores"])

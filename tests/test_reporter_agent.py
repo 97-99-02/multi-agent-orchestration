@@ -215,3 +215,13 @@ def test_summary_is_not_scaled_and_body_follows_dashboard_overflow(tmp_path, mon
     font, bold = reporter.register_korean_font()
     assert reporter._styles(font, bold, scaled=False)["body"].leading < reporter._styles(font, bold)["body"].leading
     assert reporter._LAYOUT_SCALE == 1.45
+
+
+def test_field_names_are_translated_but_english_words_kept():
+    body = "'weaknesses' 항목과 public_revenue_contracts 정보, strengths가 없다. Hailo competitive strengths."
+    assert reporter.translate_field_names(body) == "'약점' 항목과 공개 매출·계약 정보, 강점가 없다. Hailo competitive strengths."
+
+
+def test_prompt_rules_for_consistency_and_summary_citations():
+    assert "모든 장에서 같은 값·시점" in reporter.SYSTEM_PROMPT
+    assert "줄마다 끝에 출처 번호" in reporter.SYSTEM_PROMPT

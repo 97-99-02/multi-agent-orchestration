@@ -187,3 +187,24 @@ def test_same_day_press_reprints_fail_bias():
             "- [5] 뉴스1(2026-08-19). 시리즈A. news1.kr\n- [6] 더벨(2026-01-15). 기사. thebell.co.kr\n")
     reasons = node(make_report(reference=refs))["items"]["bias_control"]["reasons"]
     assert any("4건 중 3건이 같은 날(2026-08-19)" in r for r in reasons)
+
+
+# ---------- 2차 피드백 (A단계) ----------
+def test_summary_evidence_bullets_need_citations():
+    summary = ("## SUMMARY\n**결론:** 투자.\n**핵심 근거**\n- 80 TOPS 칩 개발[1]\n- 시장 연 16% 성장\n- 팀 10년 경력\n"
+               "**핵심 리스크**\n- 경쟁[2]\n")
+    reasons = node(make_report(summary=summary))["items"]["groundedness"]["reasons"]
+    assert any("SUMMARY 핵심 근거 3개 중 2개에 출처 번호 없음" in r for r in reasons)
+
+
+def test_internal_field_names_fail_groundedness():
+    risk = section("6. 사업 리스크", "[2][6]", "'weaknesses' 항목 정보가 없어 summary_caution 확인")
+    reasons = node(make_report(risk=risk))["items"]["groundedness"]["reasons"]
+    assert any("내부 자료 이름 노출: summary_caution, weaknesses" in r for r in reasons)
+    english = section("6. 사업 리스크", "[2][6]", "Hailo competitive strengths in edge NPUs")
+    assert not any("내부 자료" in r for r in node(make_report(risk=english))["items"]["groundedness"]["reasons"])
+
+
+def test_best_level_phrase_is_marketing():
+    result = node(make_report(summary="## SUMMARY\n국내 최고 수준의 기술력.\n"))
+    assert any("'최고 수준'" in r for r in result["items"]["neutrality"]["reasons"])

@@ -46,7 +46,13 @@ COMPETITION_HEADING = "경쟁 구도"
 PROMOTIONAL = ("반드시 투자", "강력 추천", "강력히 추천", "투자해야 한다", "놓치지 말아야", "확실한 수익", "틀림없")
 DISPARAGING = ("열등", "상대가 되지", "뒤처진 기업", "경쟁력이 없는")
 # 수치 근거 없이 회사 보도자료에서 옮긴 홍보 표현
-MARKETING = ("최적화된 성능", "최적의 성능", "혁신적인", "획기적인", "탁월한", "최고의")
+MARKETING = ("최적화된 성능", "최적의 성능", "혁신적인", "획기적인", "탁월한", "최고의", "최고 수준")
+# 보고서에 나오면 안 되는 내부 자료 이름 (영문 필드명). reporter가 한글로 바꾸고, 남으면 미달
+INTERNAL_NAMES = ("core_chips", "development_stage", "performance_metrics", "public_revenue_contracts",
+                  "tech_summary", "market_analysis", "competitor_analysis",
+                  "team_analysis", "summary_caution", "info_insufficient", "industry_context", "sub_market",
+                  "segment_specific", "sources_for_citation", "evaluation_rules")
+SUMMARY_EVIDENCE_LABEL = "**핵심 근거**"
 
 CITATION = re.compile(r"\[(\d+)\]")
 REFERENCE_LINE = re.compile(r"^- \[(\d+)\] ([^(\n]+?)\(([^)]*)\)", re.MULTILINE)
@@ -119,6 +125,20 @@ def check_groundedness(report: str, recommend: bool) -> list[str]:
         competition = [t for h, t in sections(body) if COMPETITION_HEADING in h]
         if competition and not CITATION.search(competition[0]):
             reasons.append("경쟁 구도 장에 인용 없음 (경쟁사 수치의 출처를 확인할 수 없음)")
+    if recommend:
+        # SUMMARY 핵심 근거: 수치·사실을 담은 줄마다 출처 번호 (분석 장 문단 검사에 안 걸리는 부분)
+        summary = next((t for h, t in sections(body) if "SUMMARY" in h.upper()), "")
+        if SUMMARY_EVIDENCE_LABEL in summary:
+            block = summary.split(SUMMARY_EVIDENCE_LABEL, 1)[1].split("**", 1)[0]
+            bullets = [ln for ln in block.splitlines() if ln.strip().startswith(("-", "*", "•"))]
+            uncited = [b for b in bullets if not CITATION.search(b)]
+            if uncited:
+                reasons.append(f"SUMMARY 핵심 근거 {len(bullets)}개 중 {len(uncited)}개에 출처 번호 없음")
+    exposed = [w for w in INTERNAL_NAMES if re.search(rf"(?<![A-Za-z_]){w}(?![A-Za-z_])", body)]
+    exposed += [w for w in ("weaknesses", "strengths")   # 일반 단어이기도 해서 필드명처럼 쓰인 경우만
+                if re.search(rf"(?<![A-Za-z_]){w}(?=['’\"]|\s*[가-힣])", body)]
+    if exposed:
+        reasons.append(f"내부 자료 이름 노출: {', '.join(exposed)}")
     marks = body.count(UNVERIFIED_MARK)
     if marks > QUALITY_MAX_UNVERIFIED:
         reasons.append(f"사실 검증에서 확인되지 않은 표현 {marks}곳 (허용 {QUALITY_MAX_UNVERIFIED})")
@@ -196,7 +216,8 @@ JUDGE_PROMPT = """너는 투자 평가 보고서의 품질 검토자다. 아래 
 보고서 문장을 고치지 말고, 항목마다 통과 여부와 미달 사유만 적는다. 사유는 보고서의 해당 문장이나 장을 짚어 구체적으로 쓴다.
 투자/보류 결정은 규칙으로 정해진 것이므로 결정의 옳고 그름은 판정하지 않는다. 결정을 설명하는 방식만 본다.
 미달은 아래처럼 내용에 문제가 있을 때만 판정한다. 표현·용어 선택·문체·분량은 미달 사유가 아니다.
-- groundedness: 보고서의 사실·수치가 [분석 자료]나 인용한 출처와 다르거나, 자료에 없는 사실을 단정함
+- groundedness: 보고서의 사실·수치가 [분석 자료]나 인용한 출처와 다르거나, 자료에 없는 사실을 단정함,
+  또는 같은 사실(양산·테이프아웃 시점, 수치 등)을 장마다 다른 값·시점으로 씀
 - neutrality: 점수·기준표가 아닌 근거로 결정을 정당화하거나, 리스크를 축소하거나, 경쟁사를 깎아내리거나,
   수치 근거 없는 회사 홍보 문구(보도자료 어투)를 사실처럼 옮김
 - bias_control: [분석 자료]에 있는 약점·리스크·반대 근거를 보고서에서 뺌, 또는 한 발표를 옮긴 기사들에만 기댐
