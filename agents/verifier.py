@@ -32,6 +32,7 @@ import re
 from pathlib import Path
 from types import SimpleNamespace
 
+from agents.judge import RUBRIC
 from agents.reporter import (
     DECISION_THRESHOLD,
     INSUFFICIENT_MAX_SCORE,
@@ -166,6 +167,7 @@ QUANTITY_PATTERN = re.compile(
 # 앞에 숫자가 있으면 한글 숫자가 아니라 단위다('14백만달러', '3,400백만달러'는 원문 표기 그대로 쓴 정상 수치)
 SPELLED_PATTERN = re.compile(r"(?<![\d.,])[일이삼사오육칠팔구십백천]+\s*(?:조|억|만)\s*(?:원|달러)")
 CITATION_PATTERN = re.compile(r"\[(\d+)\]")            # [1] [12] — 수치 검사 때는 먼저 지운다
+DATE_PATTERN = re.compile(r"(?<!\d)\d{4}-\d{2}-\d{2}(?!\d)")   # 2026-08-26 — 날짜는 수량이 아니라 먼저 지운다 ('26'을 수치로 읽지 않게)
 # 문장 나누기(마침표·'다' 뒤 공백). 뒤에 인용 번호가 오면 나누지 않는다('기업이다 [1].'의 [1]이 떨어져 나가지 않게)
 SENTENCE_SPLIT = re.compile(r"(?<=[.다])\s+(?!\[\d)")
 
@@ -244,11 +246,16 @@ def build_evidence(state: dict) -> dict:
         pairs.add((float(weight), "%"))
         values.add(float(weight))
     values.add(float(DECISION_THRESHOLD))
+    # 설계서 고정값: 채점 기준표 문구('연평균 성장률 10~20%', '매출 30억 원 이상'). 6장 기준표 대비 위치 표에 그대로 옮긴다
+    rubric = parse_quantities(RUBRIC)
+    pairs |= {(q["value"], q["unit"]) for q in rubric}
+    values |= {q["value"] for q in rubric}
 
     # 점수로 쓸 수 있는 값: 항목 점수, 기여 점수, 환산 점수, 기준·만점·정보 부족 상한
     scores = state.get("scores") or {}
     points = {float(DECISION_THRESHOLD), float(SCORE_MAX), float(INSUFFICIENT_MAX_SCORE),
               float(CORE_MIN_SCORE)}   # 보류 조건 점검 줄의 '핵심 역량 N점 미만' (N = config.CORE_MIN_SCORE)
+    points |= {q["value"] for q in rubric if q["unit"] == SCORE_UNIT}   # 기준표의 '4점 조건에 더해'
     points |= {float(info["score"]) for info in score_items(scores).values() if "score" in info}
     contributions = item_contributions(scores)
     if contributions is not None:
@@ -295,7 +302,7 @@ def _is_supported(q: dict, evidence: dict) -> bool:
 
 def find_quantity_mismatches(report: str, evidence: dict) -> tuple[list[dict], int]:
     """보고서 수량 중 정답지에 없는 것을 찾는다. (불일치 목록, 검사한 수량 개수)"""
-    body = CITATION_PATTERN.sub("", _body_of(report))   # [12] 같은 인용 번호는 수치 검사에서 제외
+    body = DATE_PATTERN.sub("", CITATION_PATTERN.sub("", _body_of(report)))   # 인용 번호·날짜는 수치 검사에서 제외
     mismatches, checked = [], 0
     for q in parse_quantities(body):
         if not _needs_check(q):
@@ -313,6 +320,9 @@ def find_wording_problems(report: str, state: dict) -> list[dict]:
     evidence_text = _evidence_json(state)
     problems = []
     for m in SPELLED_PATTERN.finditer(body):
+        line = body[body.rfind("\n", 0, m.start()) + 1:]
+        if line.startswith("|") and m.group(0) in RUBRIC:   # 기준표 대비 위치 표에 옮긴 기준표 문구('수십억 달러 이상 규모')
+            continue
         problems.append({"kind": "spelled", "value": m.group(0), "surface": m.group(0),
                          "context": "금액을 한글로 표기함(자료의 숫자 표기로 써야 대조 가능) · "
                                     + _context(body, m.start())})
