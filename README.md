@@ -90,7 +90,7 @@ graph TD
 | [tracing-6](docs/tracing-6.png) | Supervisor 결정: iHW 보류(68.0점) → 다음 후보 엑시나 |
 | [tracing-7](docs/tracing-7.png) | Supervisor 결정: 품질 평가 근거 부족 → 기술·팀·시장 관점 재조사 |
 
-트리에서는 노드가 위아래로 나열되지만, Supervisor 바로 다음에 이어진 분석 노드들은 같은 단계에서 병렬로 실행된 것이다. 실시간 웹 검색을 쓰므로 다시 실행하면 후보와 결과가 달라질 수 있다.
+트리에서는 노드가 위아래로 나열되지만, Supervisor 바로 다음에 이어진 분석 노드들은 같은 단계에서 병렬로 실행된 것이다.
 
 ## Directory Structure
 ```
@@ -118,6 +118,12 @@ uv run python app.py                      # 실행 → outputs/ 에 보고서(md
 uv run python app.py --resume <trace_id>  # 멈춘 실행 이어서
 ```
 `.env`에 `OPENAI_API_KEY`, `TAVILY_API_KEY`, `LANGSMITH_API_KEY`가 필요하다.
+
+**실행 결과 재현성**
+- 실시간 웹 검색(Tavily)이 이 시스템의 장점이라 검색 결과를 저장해 재사용하지 않는다. 그래서 실행할 때마다 후보와 결과가 달라질 수 있다. 같은 검색어를 몇 초 간격으로 넣어도 결과 목록이 달라진 경우가 있었다
+- 검색 결과가 바뀌면 세부 분야 분류 → 시장성 근거 → 점수·결정까지 달라질 수 있다 (같은 기업이 75점 투자 ↔ 63점 보류, 발굴 후보 3~5곳)
+- 완화: 검색어 고정, temperature 0 + seed 고정, 같은 기업 과거 평가와 크게 다르면 재채점(항목별 중앙값). 반복 상한이 있어 결과와 관계없이 항상 종료한다
+- 제출한 보고서와 LangSmith trace는 같은 실행(`invest-supervisor-8923c8ed`)의 결과다
 
 ## Contributors
 - 강지수 : 시장성 평가 에이전트, README
