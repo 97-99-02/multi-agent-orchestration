@@ -41,6 +41,7 @@ from agents.reporter import (
     WEIGHTS,
     _is_recommend_mode,
     cited_source_map,
+    score_claim_mismatches,
     find_insufficient_items,
     item_contributions,
     printed_reference_numbers,
@@ -232,7 +233,9 @@ def build_evidence(state: dict) -> dict:
         values : {값}          — 단위를 생략한 수는 값만 맞으면 통과
         points : {값}          — '~점'으로 쓴 수(점수)는 평가표 값과 대조
     """
-    quantities = parse_quantities(_evidence_json(state))
+    # judge의 채점 근거·리스크 문장은 LLM이 쓴 글이라 정답지에서 뺀다. 넣어 두면 judge가 잘못 환산한 값
+    # ('3,400백만달러(3.4억 달러)')을 보고서가 옮겨도 '자료에 있음'으로 통과했다. 점수 값은 아래 points로 따로 넣는다
+    quantities = parse_quantities(_evidence_json({**state, "scores": None}))
     # 출처의 근거 원문(snippet)도 정답지다 (state.Source: 사실 검증에 사용). 투자 기업의 출처만 쓴다
     name = (state.get("company") or {}).get("name")
     snippets = " ".join(str(src.get("snippet", "")) for src in state.get("sources", [])
@@ -837,6 +840,10 @@ def verifier_node(state: dict, judge_llm=None, retriever=None) -> dict:
     mismatches += find_wording_problems(report, state)
     mismatches += check_citations(report)
     mismatches += check_total_score(scores)
+    if _is_recommend_mode(state):   # '추천 기업 없음' 보고서는 여러 후보 점수를 다뤄 마지막 후보 점수와 대조할 수 없다
+        mismatches += [{"kind": "number", "value": m["surface"], "surface": m["surface"],
+                        "context": f"점수표의 {m['label']}은 {m['actual']}점 · " + _context(report, m["pos"])}
+                       for m in score_claim_mismatches(report, scores)]
 
     judge = _resolve_judge(judge_llm)
 

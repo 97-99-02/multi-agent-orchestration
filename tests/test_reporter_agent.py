@@ -465,3 +465,16 @@ def test_dates_are_not_checked_as_quantities():
     evidence = {"pairs": set(), "values": set(), "points": set()}
     mismatches, _ = verifier.find_quantity_mismatches("| 2026-08-26 | 양산 시작 |\n(2025-03-04 기준) 매출 50억 원\n", evidence)
     assert [m["surface"] for m in mismatches] == ["50억 원"]   # 날짜의 '26'·'04'는 빼고 진짜 수량만 검사한다
+
+
+def test_landscape_card_keeps_whole_sentences_up_to_hard_limit():
+    two = "삼성전자는 CXL 3.1 모듈을 준비한다. 주요 서버 기업에 샘플을 공급 중이다."
+    assert reporter._short(two, reporter.CARD_TEXT_CHARS, reporter.CARD_TEXT_HARD) == two      # 두 문장 모두
+    long_first = "가" * 150 + " 나" * 10 + "."                                                     # 한 문장 171자
+    assert reporter._short(long_first, reporter.CARD_TEXT_CHARS, reporter.CARD_TEXT_HARD) == long_first
+    huge = "다 " * 200
+    assert reporter._short(huge, reporter.CARD_TEXT_CHARS, reporter.CARD_TEXT_HARD).endswith("…")
+
+
+def test_prompt_forbids_bracket_unit_conversion_and_present_tense_forecast():
+    assert "괄호로 다른 단위의 환산값" in reporter.SYSTEM_PROMPT and "전망으로 적힌 수치" in reporter.SYSTEM_PROMPT

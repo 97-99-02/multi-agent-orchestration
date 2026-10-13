@@ -8,6 +8,7 @@ LLM: config.MODEL_ANALYZE
     경쟁사마다 tier를 붙인다: "선도 기업"(대기업·상장사, 시장 진입 위협) / "동급 기업"(비상장 스타트업, 상대적 위치 비교)
 """
 import re
+from datetime import date
 from typing import Literal
 
 from langchain_openai import ChatOpenAI
@@ -40,7 +41,7 @@ class Competitor(BaseModel):
     name: str
     country: str = Field(description="국가. 예: 한국, 미국")
     product: str = Field(description="비교 대상 제품. 없으면 빈 문자열")
-    comparison: str = Field(description="대상 기업과 비교한 한 문장 (검색 결과에 근거)")
+    comparison: str = Field(description="대상 기업과 비교한 한두 문장, 150자 이내 (검색 결과에 근거)")
 
 
 Tier = Literal["선도 기업", "동급 기업"]
@@ -83,6 +84,14 @@ PROMPT = """너는 AI 반도체 투자 심사역이다. '{name}'({segment}, 주�
 차별점과 비교 문장은 수치·사실(성능 수치, 공정, 특허, 고객)로 쓴다. 회사 보도자료의 홍보 표현('최적화된 성능',
 '혁신적인', '획기적인', '탁월한')은 옮기지 않는다. 수치·사실 근거가 없는 차별점은 쓰지 않는다.
 문장 안에 검색 결과 번호([1] 등)를 넣지 않는다. 번호는 evidence_ids에만 넣는다.
+차별점(differentiation)에는 '{name}' 자신의 기술·제품·고객 사실만 '{name}'을 주어로 쓴다. 경쟁사의 소개나 강점은
+차별점에 넣지 않는다(경쟁사 정보는 competitors의 comparison에 쓴다). 투자 유치 금액, 기업가치, 누적 투자금 같은 투자 정보도 넣지 않는다.
+
+[시점 규칙] 오늘은 {today}다. 검색 결과마다 괄호 안 게시일을 기준으로 시점을 판단한다.
+- 기사 속 '올해', '내년', '4분기' 같은 시점은 그 기사의 게시일 기준 연도로 바꿔 쓴다.
+- 기사가 과거 발언이나 이전 계획을 인용한 것('당초 ~할 예정이었다', 작년 행사에서 밝힌 계획)은 현재 계획으로 쓰지 않는다.
+- 이미 오늘 이전이 된 '예정'을 앞으로의 일처럼 쓰지 않는다. 계획을 쓸 때는 기사 게시 연월을 '(2026-05 보도)'처럼 붙인다.
+- 같은 사실의 수치가 기사마다 다르면 게시일이 가장 최근인 기사를 따른다.
 
 {results}"""
 
@@ -91,7 +100,8 @@ TIER_NOTE = """
 
 [확정된 경쟁사와 기업 구분] (상장 여부 검색으로 확인한 값)
 {tiers}
-경쟁사는 위 기업만 이 순서대로 쓴다. 비교 문장, 차별점, 경쟁 리스크에 기업 구분을 그대로 반영하라.
+경쟁사는 위 기업만 이 순서대로 쓴다. 비교 문장과 경쟁 리스크에 기업 구분을 그대로 반영하라.
+차별점(differentiation)은 평가 대상 기업 자신의 차별점만 쓴다. 경쟁사를 주어로 한 문장은 차별점에 넣지 않는다.
 선도 기업은 대기업·상장사이므로 스타트업, 신생 기업, 비슷한 단계로 쓰지 않는다.
 동급 기업은 비상장 스타트업이므로 대기업이나 상장사로 쓰지 않는다."""
 
@@ -122,6 +132,39 @@ def _norm(s: str) -> str:
 
 
 NOT_FOUND = "같은 세부 분야 경쟁사를 공개 자료로 확인하지 못함"
+# 차별점에 섞인 대상 기업 투자 정보 (프롬프트로 막아도 남는 경우를 코드로 뺀다). 시기가 다른 투자 기사의 수치가
+# 차별점에 들어가 보고서의 투자 수치가 장마다 달라진 적이 있다 (경쟁 우위가 아니라 투자조건 항목의 정보이기도 하다)
+FUNDING = re.compile(r"투자\s*유치|기업\s*가치|누적\s*투자|투자\s*금액|밸류에이션|몸값|시리즈\s*[A-Da-d](?![A-Za-z])|(?i:series\s*[a-d]\b)|프리\s*IPO")
+
+
+def _drop_funding(analysis: dict) -> dict:
+    analysis["differentiation"] = [d for d in analysis.get("differentiation") or [] if not FUNDING.search(d)]
+    return analysis
+
+
+def _name_key(name: str) -> str:
+    """기업명 비교 키: 괄호 별칭을 빼고 첫 단어만, 소문자 ('Qualcomm Technologies, Inc.' → 'qualcomm', '엑시나 (XCENA)' → '엑시나')."""
+    words = name.split("(")[0].split()
+    return re.sub(r"[^0-9a-z가-힣]", "", words[0].lower()) if words else ""
+
+
+def _keep_own_differentiation(analysis: dict, name: str) -> dict:
+    """차별점에서 경쟁사를 주어로 한 문장('Groq는 …', '삼성전자는 …')을 뺀다. 경쟁사 이름으로 시작하더라도
+    대상 기업 이름이 있거나 비교 표현('대비', '보다', '비해')이 있으면 대상 기업의 차별점으로 보고 남긴다
+    (예: '엔비디아 H100 대비 전력 효율 1.33배'). 차별점 칸에 경쟁사 소개가 채워진 보고서가 연달아 나왔다."""
+    target = _name_key(name)
+    rivals = [k for k in (_name_key(c.get("name", "")) for c in analysis.get("competitors") or []) if len(k) >= 2]
+
+    def own(text: str) -> bool:
+        compact = re.sub(r"\s+", "", text).lower()
+        if (target and target in compact) or re.search(r"대비|보다|비해", text):
+            return True
+        return not any(compact.startswith(k) for k in rivals)
+
+    analysis["differentiation"] = [d for d in analysis.get("differentiation") or [] if own(d)]
+    return analysis
+
+
 # LLM이 문장 안에 남긴 검색 결과 번호 ([3], [2,5]). 보고서 출처 번호와 섞이면 다른 출처를 가리키게 된다
 RESULT_REF = re.compile(r"\s*\[\d{1,3}(?:\s*[,~\-]\s*\d{1,3})*\]")
 
@@ -172,7 +215,8 @@ def competitor_node(state: dict) -> dict:
             f"{kw} 스타트업 투자 유치",   # 동급 기업
         ], max_results=5)
         results += search_many([SEGMENT_KEYWORDS_EN.get(segment, "AI chip companies")], max_results=5, topic="general")
-    prompt = PROMPT.format(name=name, segment=segment, product=product, results=format_results(results))
+    prompt = PROMPT.format(name=name, segment=segment, product=product, today=date.today().isoformat(),
+                           results=format_results(results))
     a = ChatOpenAI(model=MODEL_ANALYZE, temperature=0, seed=LLM_SEED, max_tokens=LLM_MAX_TOKENS).with_structured_output(CompetitorAnalysis).with_retry(stop_after_attempt=LLM_ATTEMPTS).invoke(prompt)
     evidence_ids = list(a.evidence_ids)
     analysis = a.model_dump(exclude={"evidence_ids"})
@@ -217,6 +261,8 @@ def competitor_node(state: dict) -> dict:
     prev = previous(state, "competitor_analysis") if rework else None
     if prev:
         analysis = _merge_previous(prev, analysis)
+    analysis = _drop_funding(analysis)   # 재작업 전 결과에서 넘어온 것까지 거른다
+    analysis = _keep_own_differentiation(analysis, name)
     return {
         "competitor_analysis": analysis,
         "sources": [to_source(r, name, "competitor") for r in used],

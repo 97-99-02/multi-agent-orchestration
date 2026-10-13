@@ -59,6 +59,8 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
 1. 제공된 [분석 자료]에 있는 내용과 숫자만 사용합니다. 자료에 없는 숫자·사실은 절대 만들지 않습니다.
 2. 숫자는 자료에 적힌 표기 그대로 옮깁니다. (반올림·단위 변환·추정 금지)
    '수십억 달러', '수천억 원' 같은 어림 표현을 쓰지 말고 자료의 수치를 그대로 씁니다.
+   괄호로 다른 단위의 환산값을 덧붙이지 않습니다. (예: '3,400백만달러(34억 달러)'처럼 쓰지 않습니다)
+   자료에 전망으로 적힌 수치는 '~ 전망'으로 쓰고, 이미 일어난 일처럼 쓰지 않습니다.
 3. 자료에 정보가 없으면 '정보 부족'이라고 씁니다.
 4. 출력은 마크다운이며, 아래 [목차]의 순서와 제목('## ' 형식)을 그대로 따릅니다.
 5. 맨 앞은 'SUMMARY'입니다. 900자 이내이며, 투자 추천 보고서는 반드시 아래 틀을 그대로 지킵니다.
@@ -71,8 +73,9 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
    - 리스크 (정확히 3개)
    **확인 필요**
    - 추가 확인이 필요한 사항 (1~2개). [분석 자료]에 summary_caution이 있으면 그 내용(항목명과 점수)을
-     한 항목으로 반드시 포함합니다. (예: 기술·제품 성숙도 2점(정보 부족으로 제한) 확인 필요)
-     summary_caution이 없으면 그 항목은 쓰지 않습니다.
+     한 항목으로 반드시 포함합니다. 형식은 '<항목명> <점수>점(<사유>) 확인 필요'이고, 항목명·점수·사유는
+     summary_caution에 적힌 값을 그대로 씁니다. summary_caution이 없으면 그 항목은 쓰지 않고, 항목 점수도 쓰지 않습니다.
+     보고서 어디에서든 항목 점수를 쓸 때는 scores의 점수와 같아야 합니다.
    [분석 자료]의 키 이름(summary_caution, team_analysis 등)은 본문 어디에도 쓰지 않습니다.
 6. 'REFERENCE' 장은 쓰지 않습니다. (코드가 실제 사용 출처로 자동 첨부합니다.)
 7. 본문 전체는 한글 기준 약 10,000~14,000자로 씁니다. (PDF는 대시보드·REFERENCE 포함 7~10장)
@@ -367,16 +370,31 @@ KEY_NAME_LINE_PATTERN = re.compile(r"^[ \t]*[-*][ \t]*[a-z]+_[a-z_]*[ \t]*(?:없
 
 # 기술 요약 필드명 → 보고서 표기. LLM이 "'weaknesses' 항목"처럼 필드명을 그대로 쓰는 경우를 고친다
 FIELD_LABELS = {"core_chips": "핵심 칩", "development_stage": "개발 단계", "performance_metrics": "성능 수치",
-                "public_revenue_contracts": "공개 매출·계약", "weaknesses": "약점", "strengths": "강점"}
+                "public_revenue_contracts": "공개 매출·계약", "weaknesses": "약점", "strengths": "강점",
+                # 분석 자료 키 이름 (quality.INTERNAL_NAMES와 같은 목록. judge 근거 문장이 그대로 쓰는 경우가 있다)
+                "tech_summary": "기술 요약", "market_analysis": "시장성 분석", "competitor_analysis": "경쟁사 분석",
+                "team_analysis": "팀 분석", "summary_caution": "주의 항목", "info_insufficient": "정보 부족",
+                "industry_context": "업계 해석", "sub_market": "하위 시장", "segment_specific": "세부 분야 수치",
+                "sources_for_citation": "출처 목록", "evaluation_rules": "평가 기준",
+                "missing_fields": "누락 항목", "field_status": "항목 상태"}
 # 밑줄이 있는 필드명은 어디서나, 일반 영어 단어이기도 한 weaknesses·strengths는 따옴표 안이거나 바로 뒤에
 # 한글이 올 때만 필드명으로 본다 (경쟁사 표의 영문 설명 속 단어는 그대로 둔다)
 FIELD_NAME_PATTERN = re.compile(
-    r"(?<![A-Za-z_])(core_chips|development_stage|performance_metrics|public_revenue_contracts)(?![A-Za-z_])"
+    r"(?<![A-Za-z_])(" + "|".join(k for k in FIELD_LABELS if "_" in k) + r")(?![A-Za-z_])"
     r"|(?<![A-Za-z_])(weaknesses|strengths)(?=['’\"]|\s*[가-힣])")
+# judge 근거의 '(segment_specific=true, sub_market=false)' 같은 자료 설정값 표기
+FIELD_FLAG_PATTERN = re.compile(r"\s*\(?\s*[a-z]+_[a-z_]*\s*=\s*(?:true|false)(?:\s*,\s*[a-z]+_[a-z_]*\s*=\s*(?:true|false))*\s*\)?",
+                                re.IGNORECASE)
+
+
+# 이름을 바꾼 뒤 남는 'info_insufficient: true'의 ': true' (Judge 사유가 자료를 JSON 모양 그대로 인용한 경우)
+FIELD_VALUE_PATTERN = re.compile(r"\s*:\s*(?:true|false)(?![A-Za-z])", re.IGNORECASE)   # 뒤에 한글이 오면 \b가 안 맞는다
 
 
 def translate_field_names(body: str) -> str:
-    return FIELD_NAME_PATTERN.sub(lambda m: FIELD_LABELS[m.group(1) or m.group(2)], body)
+    body = FIELD_FLAG_PATTERN.sub("", body)
+    body = FIELD_NAME_PATTERN.sub(lambda m: FIELD_LABELS[m.group(1) or m.group(2)], body)
+    return FIELD_VALUE_PATTERN.sub("", body)
 
 
 def strip_agent_refs(value):
@@ -505,7 +523,7 @@ def build_timeline_table(state: dict, sources: list[dict]) -> str | None:
         return None
     rows.sort(key=lambda e: (not e.get("date"), e.get("date") or ""))   # 날짜 미상은 맨 뒤
     lines = [TIMELINE_CAPTION, "", f"| {TIMELINE_HEADER} | 내용 | 출처 |", "|---|---|---|"]
-    lines += [f"| {_cell(e.get('date') or UNKNOWN_DATE)} | {_cell(e['text'])} "
+    lines += [f"| {_cell(e.get('date') or UNKNOWN_DATE)} | {_cell(translate_field_names(e['text']))} "
               f"| {_source_cell(sources, [e.get('url', '')])} |" for e in rows]
     return "\n".join(lines)
 
@@ -535,7 +553,7 @@ def build_score_basis_tables(scores: dict, sources: list[dict]) -> str | None:
         score = int(score)
         upper = levels[key][score] if score < SCORE_MAX else "–"
         position.append(f"| {label} | {score}/{SCORE_MAX} | {_cell(levels[key][score - 1])} | {_cell(upper)} |")
-        evidence = str(info.get("evidence") or "")
+        evidence = translate_field_names(str(info.get("evidence") or ""))   # 표는 본문 이름 변환 뒤에 들어간다
         if info.get("insufficient"):
             evidence = f"(정보 부족으로 최대 {INSUFFICIENT_MAX_SCORE}점) {evidence}"
         urls = [s.get("url", "") for s in info.get("sources") or [] if isinstance(s, dict)]
@@ -716,13 +734,36 @@ def _summary_structure_violations(summary: str) -> list[str]:
     return problems
 
 
+# 보고서 문장의 '<채점 항목> N점' 표기. 기준 설명('2점 미만', '4점 조건', '5점 만점')은 점수 주장이 아니라 뺀다
+SCORE_CLAIM_PATTERN = re.compile(
+    r"(?P<label>" + "|".join(re.escape(v) for v in ITEM_LABELS.values()) + r")(?:은|는|이|가|도)?\s*"
+    r"(?P<n>[1-5])\s*점(?!\s*(?:미만|이하|이상|초과|조건|구간|만점|이\s*되|으로\s*올리|에\s*해당하려면))")
+
+
+def score_claim_mismatches(report: str, scores: dict) -> list[dict]:
+    """본문에 쓴 '<채점 항목> N점'이 실제 항목 점수와 다른 곳. [{surface, label, claimed, actual, pos}]
+    LLM이 프롬프트 예시('기술·제품 성숙도 2점(정보 부족으로 제한)')를 베껴 점수표(4점)와 다른 점수를 SUMMARY에 쓴 적이 있다.
+    사실 검증의 수치 대조는 '2점'을 정보 부족 상한 값으로 보고 통과시켜, 항목과 점수를 묶어서 따로 대조한다."""
+    items = score_items(scores)
+    body = report.partition(REFERENCE_HEADING)[0]
+    found = []
+    for m in SCORE_CLAIM_PATTERN.finditer(body):
+        actual = (items.get(m.group("label")) or {}).get("score")
+        if isinstance(actual, (int, float)) and int(m.group("n")) != int(actual):
+            found.append({"surface": m.group(0), "label": m.group("label"), "claimed": int(m.group("n")),
+                          "actual": int(actual), "pos": m.start()})
+    return found
+
+
 def check_format(report: str, structured_summary: bool = False,
-                 summary_names: list[str] | tuple = (), summary_cautions: list[str] | tuple = ()) -> list[str]:
+                 summary_names: list[str] | tuple = (), summary_cautions: list[str] | tuple = (),
+                 scores: dict | None = None) -> list[str]:
     """과제 조건 위반 목록을 돌려준다. 비어 있으면 모두 통과.
 
     점검: SUMMARY 맨 앞·길이, REFERENCE 맨 뒤, 전체 MAX_PAGES장 이내(글자 수 근사),
     structured_summary=True면 SUMMARY 고정 틀까지, summary_names가 있으면 SUMMARY에 그 이름(후보)이 모두 있는지,
-    summary_cautions가 있으면 SUMMARY '확인 필요'에 그 항목 이름이 있는지.
+    summary_cautions가 있으면 SUMMARY '확인 필요'에 그 항목 이름이 있는지,
+    scores가 있으면 본문의 '<채점 항목> N점' 표기가 실제 점수와 같은지.
     (실제 페이지 수는 PDF 저장 때 다시 센다)
     """
     sections = _sections(report)
@@ -756,6 +797,9 @@ def check_format(report: str, structured_summary: bool = False,
     limit = PAGE_CHARS * MAX_PAGES
     if len(report) > limit:
         violations.append(f"전체 분량이 {len(report)}자로 {MAX_PAGES}장 기준({limit}자)을 넘습니다. 줄이세요.")
+    for m in score_claim_mismatches(report, scores or {}):
+        violations.append(f"'{m['surface']}'는 점수표의 실제 점수({m['label']} {m['actual']}점)와 다릅니다. "
+                          f"점수는 점수표와 같게 쓰고, 근거 없는 점수는 쓰지 마세요.")
     return violations
 
 
@@ -1034,7 +1078,8 @@ def reporter_node(state: dict, llm=None) -> dict:
         violations = check_format(report, structured_summary=recommend,   # 과제 조건을 코드로 점검
                                   summary_names=(state.get("candidates") or []) if recommend else (),
                                   summary_cautions=[c.get("label", "") for c in cautions_of(state["scores"])
-                                                    if c.get("label")] if recommend else ())
+                                                    if c.get("label")] if recommend else (),
+                                  scores=state["scores"] if recommend else None)
         if not violations:
             break
         logger.warning("[보고서 생성] 과제 조건 위반 %d건: %s", len(violations), violations)
@@ -1279,17 +1324,29 @@ def _column_box(title: str, caption: str, cards: list, width: float, background:
     return box
 
 
-CARD_TEXT_CHARS, CARD_PRODUCT_CHARS = 110, 60   # 경쟁 구도 그림 카드에 싣는 설명·제품 글자 수
+# 경쟁 구도 그림 카드에 싣는 설명·제품 글자 수. 문장 단위로 이 길이까지 싣고, 문장 중간에서는 자르지 않는다
+# (중간에서 자르면 PDF에 '…'로 끝난 문장이 남았다). 한 문장이 HARD 길이를 넘는 드문 경우만 자른다
+CARD_TEXT_CHARS, CARD_PRODUCT_CHARS = 170, 80
+CARD_TEXT_HARD, CARD_PRODUCT_HARD = 260, 120
 SENTENCE_END = re.compile(r"(?<=[.!?])\s|(?<=다\.)")
 
 
-def _short(text: str, limit: int) -> str:
-    """첫 문장만, 그래도 길면 limit 글자에서 단어 단위로 자른다."""
+def _short(text: str, limit: int, hard: int | None = None) -> str:
+    """limit 글자 안에 들어가는 만큼 문장 단위로 싣는다. 첫 문장은 limit을 넘어도 hard까지는 그대로 싣고,
+    hard를 넘을 때만 단어 단위로 자른다 (경쟁사 설명이 길면 그림이 한 쪽보다 커져 앞 쪽이 비었다)."""
     text = (text or "").strip()
-    first = SENTENCE_END.split(text, maxsplit=1)[0].strip() if text else ""
-    if len(first) <= limit:
-        return first
-    cut = first[:limit].rsplit(" ", 1)[0]
+    if not text:
+        return ""
+    sentences = [x.strip() for x in SENTENCE_END.split(text) if x.strip()]
+    kept = sentences[0]
+    for sentence in sentences[1:]:
+        if len(kept) + 1 + len(sentence) > limit:
+            break
+        kept += " " + sentence
+    hard = hard or limit
+    if len(kept) <= hard:
+        return kept
+    cut = kept[:hard].rsplit(" ", 1)[0]
     return cut.rstrip(",·;:") + "…"
 
 
@@ -1304,7 +1361,8 @@ def _landscape(block: list[str], styles: dict, width: float) -> Table:
     def card(name, country, product, comparison):
         # 경쟁사 설명이 길면(영문 소개문 등) 그림이 한 쪽 남은 공간보다 커져 통째로 다음 쪽으로 넘어가고
         # 앞 쪽이 비었다. 그림 카드에는 첫 문장만 짧게 싣는다 (보고서 본문 표에는 전체가 남아 있다)
-        product, comparison = _short(product, CARD_PRODUCT_CHARS), _short(comparison, CARD_TEXT_CHARS)
+        product = _short(product, CARD_PRODUCT_CHARS, CARD_PRODUCT_HARD)
+        comparison = _short(comparison, CARD_TEXT_CHARS, CARD_TEXT_HARD)
         meta = " · ".join(v for v in (country, product) if v and v != "–")
         text = f"<b>{_inline(name)}</b>" + (f' <font size="7.5" color="{MUTED}">{_inline(meta)}</font>' if meta else "")
         if comparison and comparison != "–":

@@ -1,17 +1,31 @@
-"""웹 검색 공통 도우미 (Tavily). 검색 결과를 state.Source 형식 출처로 바꾸는 함수도 둔다."""
+"""웹 검색 공통 도우미 (Tavily). 검색 결과를 state.Source 형식 출처로 바꾸는 함수도 둔다.
+
+2차 출처(블로그·뉴스레터·포털 재전송 등)는 그대로 쓰지 않고 원본을 찾아 내용을 확인한 뒤 원본으로 바꾼다
+(resolve_secondary). 블로그가 옮겨 적은 수치는 원본과 시점·표기가 달라질 수 있어서다.
+"""
+import html as html_lib
+import logging
 import re
 import urllib.request
 from datetime import date, timezone
 from email.utils import parsedate_to_datetime
 from functools import lru_cache
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 from zoneinfo import ZoneInfo
 
 from langchain_tavily import TavilySearch
 
+logger = logging.getLogger(__name__)
+
 
 def search(query: str, max_results: int = 8, topic: str = "news") -> list[dict]:
-    """Tavily 검색 결과 리스트. 각 항목: title, url, content, published_date"""
+    """Tavily 검색 결과 리스트. 각 항목: title, url, content, published_date.
+    2차 출처는 원본으로 바꾸거나(확인된 경우) 뺀다 (resolve_secondary)."""
+    return resolve_secondary(_tavily(query, max_results, topic))
+
+
+def _tavily(query: str, max_results: int = 8, topic: str = "news") -> list[dict]:
+    """Tavily 검색 원본 결과 (2차 출처 처리 전)."""
     response = TavilySearch(max_results=max_results, topic=topic).invoke({"query": query})
     # 결과가 0건이면 langchain-tavily가 ToolException을 문자열로 돌려준다(handle_tool_error=True).
     # 작은 스타트업의 좁은 검색어에서 자주 생기며, 오류가 아니라 '결과 없음'으로 처리한다
@@ -132,3 +146,185 @@ def to_source(r: dict, company: str, node: str) -> dict:
         "url": r["url"],
         "snippet": r["content"][:800],
     }
+
+
+# ═════════════════════════════════════════════════════════════
+# 2차 출처 → 원본 확인
+# ═════════════════════════════════════════════════════════════
+# 블로그·뉴스레터·위키 등: 남의 기사를 옮겨 적거나 요약한 글. 원본을 확인하지 못하면 근거로 쓰지 않는다
+# (블로그가 1년 전 투자 기사 수치를 최신처럼 옮겨 보고서 수치가 서로 어긋난 적이 있다)
+SECONDARY_HOSTS = ("tistory.com", "blog.naver.com", "post.naver.com", "cafe.naver.com", "contents.premium.naver.com",
+                   "brunch.co.kr", "velog.io", "medium.com", "blogspot.com", "wordpress.com", "cafe.daum.net",
+                   "namu.wiki", "wikipedia.org", "demoday.co.kr",
+                   # SNS 게시물: 기사·공시를 옮겨 적은 글이다 (인스타그램 게시물이 실적 점수의 유일한 출처가 된 적이 있다)
+                   "instagram.com", "facebook.com", "linkedin.com", "x.com", "twitter.com", "threads.net",
+                   "youtube.com")
+# 포털 재전송: 언론사 기사를 그대로 옮긴 페이지. 원본 기사로 바꾸되, 원본을 못 찾아도 내용은 언론사 기사라 그대로 둔다
+PORTAL_HOSTS = ("v.daum.net", "news.daum.net", "news.nate.com", "n.news.naver.com", "news.naver.com", "news.zum.com",
+                "msn.com")
+# 원본으로 볼 수 없는 링크 (공유·광고·검색·SNS)
+_NOT_ORIGINAL = ("facebook.com", "twitter.com", "x.com", "instagram.com", "youtube.com", "kakao.com", "google.com", "google.co.kr",
+                 "apple.com", "naver.com", "daum.net", "nate.com", "tistory.com", "linkedin.com")
+_ANCHOR = re.compile(r"""<a\b[^>]*?href=["']([^"']+)["'][^>]*>(.*?)</a>""", re.S | re.I)
+_ORIGINAL_TEXT = re.compile(r"^\s*(?:기사\s*)?원문(?:\s*보기)?\s*$|원문\s*기사|기사\s*원문|^\s*출처\b|^\s*source\b", re.I)
+_SOURCE_CONTEXT = re.compile(r"(?:출처|원문|source|via)\s*[:：]?\s*$", re.I)   # 링크 바로 앞에 '출처:'가 있는 경우
+_FACT = re.compile(r"\d[\d,.]*\s*(?:조|억|만|천)?\s*(?:원|달러|%|배|명|개|나노|nm|TOPS|W)|\d{4}년|\d{2,}[\d,.]*")
+_WORD = re.compile(r"[가-힣A-Za-z][가-힣A-Za-z0-9]{1,}")
+MAX_ORIGINAL_CANDIDATES = 2   # 2차 출처 하나에서 따라가 볼 원본 링크 수
+EXCERPT_CHARS = 1500          # 원본에서 옮길 본문 길이 (Tavily content와 비슷한 분량)
+
+
+def _host_in(url: str, hosts: tuple) -> bool:
+    host = (urlparse(url).hostname or "").lower()
+    return any(host == h or host.endswith("." + h) for h in hosts)
+
+
+def is_secondary(url: str) -> bool:
+    return _host_in(url, SECONDARY_HOSTS)
+
+
+def is_portal(url: str) -> bool:
+    return _host_in(url, PORTAL_HOSTS)
+
+
+@lru_cache(maxsize=256)
+def fetch_page(url: str) -> tuple[str, str]:
+    """(최종 url, HTML). 못 읽으면 ("", ""). 한국 언론사는 EUC-KR 페이지가 있어 charset을 따른다."""
+    host = urlparse(url).hostname or ""
+    if not url.startswith(("http://", "https://")) or host.split(".")[-2:-1] == ["example"]:
+        return "", ""
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": _BROWSER_UA})
+        with urllib.request.urlopen(request, timeout=6) as response:
+            raw = response.read(800_000)
+            final = response.geturl()
+            charset = response.headers.get_content_charset()
+    except Exception:  # noqa: BLE001 - 원본을 못 읽으면 확인 실패로 처리한다
+        return "", ""
+    if not charset:
+        m = re.search(rb"""charset=["']?([\w-]+)""", raw[:4000])
+        charset = m.group(1).decode() if m else "utf-8"
+    try:
+        return final, raw.decode(charset, "ignore")
+    except LookupError:
+        return final, raw.decode("utf-8", "ignore")
+
+
+def page_text(html: str) -> str:
+    """HTML에서 본문 글자만 (스크립트·스타일 제거, 태그 → 공백)."""
+    html = re.sub(r"(?is)<(script|style|noscript|template)\b.*?</\1>", " ", html)
+    return re.sub(r"\s+", " ", html_lib.unescape(re.sub(r"(?s)<[^>]+>", " ", html))).strip()
+
+
+def page_title(html: str) -> str:
+    m = (re.search(r"""<meta[^>]+property=["']og:title["'][^>]+content=["']([^"']+)""", html, re.I)
+         or re.search(r"(?is)<title[^>]*>(.*?)</title>", html))
+    return html_lib.unescape(m.group(1)).strip() if m else ""
+
+
+def original_links(url: str, html: str) -> list[str]:
+    """2차 출처 페이지에서 원본 기사로 보이는 링크. '원문', '출처'라고 적힌 링크만 따른다 (관련 기사 목록은 따르지 않는다)."""
+    host = urlparse(url).hostname
+    found = []
+    for m in _ANCHOR.finditer(html):
+        href = html_lib.unescape(urljoin(url, m.group(1).strip()))
+        text = re.sub(r"(?s)<[^>]+>", "", m.group(2))
+        # 링크 바로 앞 글자. 앞 링크의 글자('원문')가 섞이지 않게 마지막 </a> 뒤만 본다
+        before = re.split(r"(?i)</a>", html[max(0, m.start() - 80):m.start()])[-1]
+        before = re.sub(r"(?s)<[^>]+>", " ", before)
+        if (not href.startswith(("http://", "https://")) or urlparse(href).hostname == host
+                or _host_in(href, _NOT_ORIGINAL) or is_secondary(href) or is_portal(href)):
+            continue
+        if _ORIGINAL_TEXT.search(text) or _SOURCE_CONTEXT.search(before):
+            found.append(href)
+    return list(dict.fromkeys(found))
+
+
+def _norm_fact(s: str) -> str:
+    return re.sub(r"[\s,]", "", s)
+
+
+def confirms(secondary: str, original: str) -> bool:
+    """원본 본문이 2차 출처 내용을 뒷받침하는가. 수치가 2개 이상이면 절반 이상이 원본에 있어야 하고,
+    수치가 적으면 단어의 40% 이상이 원본에 있어야 한다 (제목만 같고 내용이 다른 페이지를 거른다)."""
+    target = _norm_fact(original)
+    facts = {_norm_fact(f) for f in _FACT.findall(secondary)} - {""}
+    if len(facts) >= 2:
+        return sum(f in target for f in facts) * 2 >= len(facts)
+    words = set(_WORD.findall(secondary))
+    return bool(words) and sum(w in original for w in words) / len(words) >= 0.4
+
+
+def excerpt(secondary: str, original: str, limit: int = EXCERPT_CHARS) -> str:
+    """원본 본문에서 2차 출처의 수치·단어가 나온 부분을 앞뒤로 잘라 이어 붙인다 (없으면 본문 앞부분)."""
+    spans = []
+    for f in sorted({f.strip() for f in _FACT.findall(secondary)} | set(_WORD.findall(secondary)[:20]), key=len, reverse=True):
+        pos = original.find(f)
+        if pos >= 0 and len(f) >= 2:
+            spans.append((max(0, pos - 150), pos + len(f) + 150))
+    if not spans:
+        return original[:limit]
+    spans.sort()
+    merged = [list(spans[0])]
+    for s, e in spans[1:]:
+        if s <= merged[-1][1]:
+            merged[-1][1] = max(merged[-1][1], e)
+        else:
+            merged.append([s, e])
+    return " [...] ".join(original[s:e].strip() for s, e in merged)[:limit]
+
+
+def _original_by_title(title: str) -> list[str]:
+    """원문 링크가 없는 포털 재전송: 같은 제목 기사를 검색해 원본 언론사 기사 후보를 찾는다."""
+    core = re.sub(r"\s*[-|:]\s*[^-|:]+$", "", title).strip() or title   # 제목 끝 ' - 언론사' 제거
+    if len(core) < 8:
+        return []
+    try:
+        results = _tavily(core, max_results=5, topic="general")
+    except Exception:  # noqa: BLE001 - 검색 실패는 원본 미확인으로 처리한다
+        return []
+    words = set(_WORD.findall(core))
+    out = []
+    for r in results:
+        if is_secondary(r["url"]) or is_portal(r["url"]):
+            continue
+        if words and sum(w in r.get("title", "") for w in words) / len(words) >= 0.6:
+            out.append(r["url"])
+    return out
+
+
+@lru_cache(maxsize=256)
+def find_original(url: str, title: str, content: str) -> dict | None:
+    """2차 출처의 원본 기사를 찾아 내용을 확인한다. 확인되면 원본으로 만든 검색 결과, 아니면 None."""
+    final, html = fetch_page(url)
+    candidates = original_links(final or url, html) if html else []
+    if not candidates and is_portal(url):
+        candidates = _original_by_title(page_title(html) if html else title)
+    for link in candidates[:MAX_ORIGINAL_CANDIDATES]:
+        o_url, o_html = fetch_page(link)
+        if not o_html:
+            continue
+        text = page_text(o_html)
+        if confirms(content, text):
+            return {"title": page_title(o_html) or title, "url": o_url or link,
+                    "content": excerpt(content, text), "via": url}
+    return None
+
+
+def resolve_secondary(results: list[dict]) -> list[dict]:
+    """2차 출처를 원본으로 바꾼다. 원본을 확인하지 못한 블로그류는 빼고, 포털 재전송은 그대로 둔다."""
+    out = []
+    for r in results:
+        url = r.get("url", "")
+        if not (is_secondary(url) or is_portal(url)):
+            out.append(r)
+            continue
+        original = find_original(url, r.get("title", ""), r.get("content", ""))
+        if original:
+            logger.info("[웹] 2차 출처 → 원본 확인: %s → %s", url, original["url"])
+            out.append(original)
+        elif is_portal(url):
+            out.append(r)
+        else:
+            logger.info("[웹] 2차 출처의 원본을 확인하지 못해 제외: %s", url)
+    return out
