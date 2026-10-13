@@ -15,6 +15,7 @@ from typing import Literal
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
+from agents.rework import previous, rework_of, union
 from config import LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MODEL_ANALYZE
 from rag.retriever import get_retriever, to_source
 
@@ -25,6 +26,16 @@ SEGMENT_QUERIES = {
     "차량용": ["자율주행 차량용 AI 반도체 시장 규모 전망", "차량용 반도체 시장 성장률", "자율주행 AI 칩 수요 요인"],
     "인프라": ["HBM AI 메모리 시장 규모 전망", "CXL 메모리 시장 성장률", "AI 메모리 수요 요인"],
     "기타": ["AI 반도체 시장 규모 전망", "AI 반도체 시장 연평균 성장률", "AI 반도체 수요 요인"],
+}
+
+# Supervisor 재작업용 검색어. 첫 실행의 세부 분야 검색어와 다르게, 상위 분야(AI 반도체 전체) 전망과
+# 다른 표현(수요처·출하량)으로 찾는다. 검색어가 같으면 같은 청크만 나온다
+REWORK_QUERIES = {
+    "데이터센터": ["AI 서버 반도체 수요 전망 보고서", "GPU NPU 가속기 출하량 시장 점유율"],
+    "엣지": ["AI PC 스마트폰 NPU 탑재 전망", "온디바이스 AI 칩 출하량 시장"],
+    "차량용": ["자율주행 SoC 시장 전망 보고서", "차량용 AI 칩 수요 완성차"],
+    "인프라": ["AI 데이터센터 메모리 수요 전망", "고대역폭 메모리 공급 시장 전망"],
+    "기타": ["AI 반도체 산업 동향 전망 보고서", "AI 칩 수요처별 시장 전망"],
 }
 
 # 수치가 대상 세부 분야의 것인지 코드로 판정할 때 쓰는 용어. scope와 근거 조각 원문에 모두 있어야 한다
@@ -151,19 +162,33 @@ def is_sufficient(figures: list[dict]) -> bool:
     return {"시장규모", "성장률"} <= kinds
 
 
+def _figure_key(f: dict) -> tuple:
+    return (f["kind"], _compact(f["value"]), f.get("year", ""), _compact(f.get("scope", "")))
+
+
 def market_node(state: dict) -> dict:
     c = state["company"]
     name, segment = c["name"], c.get("segment") or "기타"
     queries = SEGMENT_QUERIES.get(segment, SEGMENT_QUERIES["기타"])
+    rework = rework_of(state, "market")
 
-    docs = retrieve(queries, "market")
-    a, figures = extract(name, segment, docs)
-    searched = ["market"]
-    if not is_sufficient(figures):
-        # 세부 분야 수치가 없으면 기술 문서의 시장 전망 부분으로 1회 재검색
-        docs = docs + retrieve(queries, "tech")
+    if rework:
+        # Supervisor 재작업: 다른 검색어 + 상위 분야 검색어로 시장·기술 문서를 함께 찾는다 (노드 안 재검색은 하지 않음)
+        queries = REWORK_QUERIES.get(segment, REWORK_QUERIES["기타"])
+        if segment != "기타":
+            queries = queries + SEGMENT_QUERIES["기타"][:2]
+        docs = retrieve(queries, "market") + retrieve(queries, "tech")
         a, figures = extract(name, segment, docs)
-        searched.append("tech")
+        searched = ["market", "tech", "rework"]
+    else:
+        docs = retrieve(queries, "market")
+        a, figures = extract(name, segment, docs)
+        searched = ["market"]
+        if not is_sufficient(figures):
+            # 세부 분야 수치가 없으면 기술 문서의 시장 전망 부분으로 1회 재검색
+            docs = docs + retrieve(queries, "tech")
+            a, figures = extract(name, segment, docs)
+            searched.append("tech")
 
     # 출처는 남은 수치와 LLM이 근거로 고른 조각만 (REFERENCE에 쓰지 않은 문서가 들어가지 않게)
     used = sorted({f.pop("evidence_id") for f in figures} | {i for i in a.evidence_ids if 0 <= i < len(docs)})
@@ -176,6 +201,16 @@ def market_node(state: dict) -> dict:
         "searched": searched,
         "info_insufficient": not is_sufficient(figures),
     }
+    prev = previous(state, "market_analysis") if rework else None
+    if prev:
+        # 재작업 전에 확인한 수치·요인은 유지하고 새로 찾은 것만 더한다
+        analysis["figures"] = union(prev.get("figures") or [], analysis["figures"], key=_figure_key)
+        analysis["demand_drivers"] = union(prev.get("demand_drivers") or [], analysis["demand_drivers"], key=_compact)
+        analysis["market_risks"] = union(prev.get("market_risks") or [], analysis["market_risks"], key=_compact)
+        analysis["searched"] = union(prev.get("searched") or [], searched)
+        analysis["info_insufficient"] = not is_sufficient(analysis["figures"])
+        if analysis["summary"] == "정보 부족" and prev.get("summary"):
+            analysis["summary"] = prev["summary"]
     return {
         "market_analysis": analysis,
         "sources": [to_source(docs[i], name, "market") for i in used],
