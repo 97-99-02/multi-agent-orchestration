@@ -115,6 +115,10 @@ PROMPT = """너는 AI 반도체 VC의 투자 심사역이다. '{name}'을 아래
     누락 여부이므로 공정·약점·계약 등 다른 항목의 누락만으로 tech를 정보 부족 처리하지 않는다.
     industry_context가 없거나 비교 조건이 부족해도 웹으로 확인된 개발 단계의 근거는 유지한다.
     경쟁 우위의 수치 비교는 동일 조건이 확인된 경우만 사용한다.
+11. competition은 competitor_analysis의 claims와 differentiation(원문으로 확인된 주장)만 근거로 쓴다.
+    comparable=false인 수치는 우위 근거가 아니고, speaker가 대상 기업인 내용(회사 발표)은 제3자 검증이 아니다.
+12. deal 5점의 전략적 투자자는 사업 연관 대기업·사업회사(계열 CVC 포함)다. 은행·보험·증권·캐피탈·VC·정책금융기관은
+    재무적 투자자다.
 
 [분석 자료]
 {materials}
@@ -169,6 +173,61 @@ def market_growth_cap(market: dict | None) -> tuple[int | None, str]:
     return cap, f"세부 분야 전체 성장률 최저 {low:g}%"
 
 
+IP_SW_KINDS = ("특허", "소프트웨어 개발 환경")
+NUMERIC_KINDS = ("성능 수치", "전력 효율")
+
+
+def competition_cap(analysis: dict | None) -> tuple[int | None, str, bool]:
+    """경쟁사 분석이 원문으로 확인한 주장으로 기준표의 경쟁 우위 조건을 확인한다. (상한, 사유, 비교 근거 없음)
+    기준표: 수치 우위 제시 3점, 더해 특허·자체 소프트웨어 개발 환경 4점, 더해 제3자 검증 5점.
+    수치는 같은 측정 조건(comparable)일 때만 우위 근거로 보고, 회사가 발표한 내용은 제3자 검증으로 보지 않는다.
+    왜: 회사 발표 수치('동급 GPU 대비 2배')로 5점, 수치 우위가 없다고 적고도 3점을 준 실행이 있었다.
+    예전 형식(주장 단위가 아님)이면 (None, "", False)
+    """
+    analysis = analysis or {}
+    competitors = analysis.get("competitors") or []
+    strengths = [x for x in analysis.get("differentiation") or [] if isinstance(x, dict)]
+    if not strengths and not any("claims" in c for c in competitors):
+        return None, "", False
+    claims = strengths + [x for c in competitors for x in c.get("claims") or []]
+    no_comparison = not any(c.get("claims") for c in competitors)
+    if not any(x.get("basis") == "수치" and x.get("comparable") for x in claims):
+        return 2, "같은 조건의 수치 우위 근거 없음", no_comparison
+    if not any(x.get("kind") in IP_SW_KINDS for x in strengths):
+        return 3, "특허·자체 소프트웨어 개발 환경 근거 없음", no_comparison
+    if not any(x.get("kind") == "제3자 검증" or (x.get("speaker") == "제3자" and x.get("kind") in NUMERIC_KINDS)
+               for x in strengths):
+        return 4, "제3자 검증 근거 없음", no_comparison
+    return None, "", no_comparison
+
+
+def _name_pattern(names: tuple[str, ...]) -> re.Pattern:
+    """기업 이름 목록 정규식. 영문 약칭은 앞뒤에 영문자가 없을 때만 ('KT'가 'KTB'에 걸리지 않게)."""
+    return re.compile("|".join(rf"(?<![A-Za-z]){re.escape(n)}(?![A-Za-z])" if n.isascii() else re.escape(n) for n in names),
+                      re.IGNORECASE)
+
+
+# 전략적 투자자: 사업 연관 대기업·사업회사와 그 계열 CVC. 그룹 이름이 있어도 금융 계열사는 재무적 투자자다
+STRATEGIC_GROUPS = _name_pattern((
+    "삼성", "SK", "LG", "현대", "기아", "롯데", "포스코", "POSCO", "한화", "KT", "네이버", "카카오", "CJ", "두산", "GS", "LS",
+    "효성", "신세계", "엔비디아", "NVIDIA", "인텔", "Intel", "퀄컴", "Qualcomm", "AMD", "Arm", "TSMC", "마이크로소프트",
+    "Microsoft", "구글", "Google", "아마존", "Amazon", "소니", "Sony", "ASML"))
+FINANCIAL_AFFILIATE = re.compile(r"증권|생명|화재|손해보험|캐피탈|자산운용|은행|카드")
+
+
+def is_strategic(investor: str) -> bool:
+    return bool(STRATEGIC_GROUPS.search(investor)) and not FINANCIAL_AFFILIATE.search(investor)
+
+
+def deal_cap(company: dict | None) -> tuple[int | None, str]:
+    """기준표 투자조건 5점은 '전략적 투자자(대기업 등) 참여'. 탐색 결과 투자사 중 전략적 투자자가 없으면 최대 4점.
+    왜: 산업은행·교보생명 같은 재무적 투자자를 전략적 투자자로 보고 5점을 준 실행이 있었다."""
+    investors = [str(x) for x in (company or {}).get("investors") or []]
+    if any(is_strategic(x) for x in investors):
+        return None, ""
+    return 4, "확인된 투자사가 모두 재무적 투자자" if investors else "투자사 정보 없음"
+
+
 def apply_evidence_rules(card: Scorecard, state: dict, sources: list[dict]) -> dict:
     """설계 3.5 근거 규칙을 코드로 적용한다.
     정보 부족이거나 유효한 출처가 없는 항목은 최대 2점으로 제한한다 (근거 없이 높은 점수 방지).
@@ -182,8 +241,13 @@ def apply_evidence_rules(card: Scorecard, state: dict, sources: list[dict]) -> d
         "traction": is_placeholder(state.get("tech_summary"))
                     or not (state.get("tech_summary") or {}).get("public_revenue_contracts", True),
         "team": is_placeholder(state.get("team_analysis")),
-        "competition": is_placeholder(state.get("competitor_analysis")),
+        # 경쟁사 비교 근거를 재작업 뒤에도 원문으로 확인하지 못했으면 정보 부족 (supervisor 충분성 판정과 같은 기준)
+        "competition": is_placeholder(state.get("competitor_analysis"))
+                       or competition_cap(state.get("competitor_analysis"))[2],
     }
+    caps = {"market": market_growth_cap(state.get("market_analysis")),
+            "competition": competition_cap(state.get("competitor_analysis"))[:2],
+            "deal": deal_cap(state.get("company"))}
     items = {}
     for key in WEIGHTS:
         s: ItemScore = getattr(card, key)
@@ -195,11 +259,10 @@ def apply_evidence_rules(card: Scorecard, state: dict, sources: list[dict]) -> d
         evidence = s.evidence
         if insufficient and "정보 부족" not in evidence:
             evidence = f"정보 부족: {evidence}"
-        if key == "market":
-            cap, basis = market_growth_cap(state.get("market_analysis"))
-            if cap is not None and score > cap:
-                score = cap
-                evidence = f"{evidence} (기준표 상한: {basis} → 최대 {cap}점)"
+        cap, basis = caps.get(key, (None, ""))
+        if cap is not None and score > cap:
+            score = cap
+            evidence = f"{evidence} (기준표 상한: {basis} → 최대 {cap}점)"
         items[key] = {"score": score, "evidence": evidence, "sources": cited, "insufficient": insufficient}
     return items
 
