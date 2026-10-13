@@ -29,10 +29,18 @@ def _source_key(s: Source) -> tuple:
     return (s.get("company"), s.get("node"), s.get("source_id"), s.get("url"), s.get("page"), s.get("snippet"))
 
 
+# 탐색 에이전트가 다음 후보로 넘어갈 때 sources 맨 앞에 넣는 표시. reducer가 이전 기업 출처를 비운다
+# (누적 reducer는 값을 넣으면 더해지기만 해서, 비우려면 표시가 필요하다)
+SOURCES_RESET: Source = {"node": "__reset__"}
+
+
 def merge_sources(old: list[Source], new: list[Source]) -> list[Source]:
     """재작업으로 같은 에이전트가 같은 출처를 다시 넣어도 한 번만 남긴다.
     다른 에이전트가 같은 기사를 쓴 경우(node가 다름)는 지금처럼 둘 다 남긴다.
+    new에 SOURCES_RESET이 있으면 그 앞까지의 출처(이전 기업 것)를 버린다 (후보가 늘어도 State가 쌓이지 않게).
     """
+    if SOURCES_RESET in new:
+        old, new = [], new[len(new) - new[::-1].index(SOURCES_RESET):]
     seen = {_source_key(s) for s in old}
     merged = list(old)
     for s in new:
@@ -77,6 +85,8 @@ class GraphState(TypedDict, total=False):
     report_version: int                    # reporter가 새로 쓸 때마다 +1 (verifier의 메모 추가는 해당 없음)
     retry_count: int                       # 사실 검증 불일치로 인한 재작성 횟수
     quality_loops: int                     # 품질 평가 미달로 인한 재작성 횟수
+    research_loops: int                    # 품질 평가 근거 부족으로 인한 관점 재조사 횟수 (기업 단위)
+    reopen_stage: Optional[str]            # 재조사 진행 단계: "research"(관점 재조사 중) → "judge"(재판단 중) → None
     last_decision: str                     # 마지막 라우팅 결정 한 줄 (상세는 obs.py 결정 로그)
     last_error: Optional[str]
 
@@ -84,7 +94,8 @@ class GraphState(TypedDict, total=False):
 # supervisor만 쓰는 키. 하위 에이전트 반환값에 이 키가 있으면 안 된다 (테스트로 확인)
 CONTROL_KEYS = frozenset({
     "trace_id", "step_count", "current_index", "next_nodes", "evidence_status", "rework_count",
-    "rework_request", "report_version", "retry_count", "quality_loops", "last_decision", "last_error",
+    "rework_request", "report_version", "retry_count", "quality_loops", "research_loops", "reopen_stage",
+    "last_decision", "last_error",
 })
 
 # 다음 후보로 넘어갈 때 탐색 에이전트가 비우는 페이로드 (이전 기업 내용이 섞이지 않게)
@@ -97,6 +108,10 @@ RESET_ON_NEXT = {
     "competitor_analysis": None,
     "team_analysis": None,
     "scores": None,
+    # 재조사 후 재판단이 보류로 바뀌어 다음 후보로 넘어가는 경우, 이전 기업 보고서·검증·평가 결과를 비운다
+    "report": "",
+    "verify_result": {},
+    "eval_result": None,
 }
 
 # 다음 후보로 넘어갈 때 supervisor가 비우는 제어 메타 (재작업 횟수·요청은 기업 단위)
@@ -104,4 +119,8 @@ CONTROL_RESET_ON_NEXT = {
     "evidence_status": {},
     "rework_count": {},
     "rework_request": {},
+    "retry_count": 0,
+    "quality_loops": 0,
+    "research_loops": 0,
+    "reopen_stage": None,
 }

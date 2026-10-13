@@ -6,7 +6,7 @@
 2) 매 호출: candidates[current_index] 기업을 다시 검색해 최신 조건을 상세 확인하고 세부 분야 분류
    current_index는 supervisor가 정한 '지금 평가할 후보 순번'으로 읽기만 한다 (제어 키는 supervisor만 쓴다)
 출력: candidates, company, is_eligible, eligibility_reason, sources, rejected(미충족 시)
-  - 이전 기업 분석 결과는 state.RESET_ON_NEXT 로 비운다
+  - 이전 기업 분석 결과는 state.RESET_ON_NEXT 로, 이전 기업 출처는 state.SOURCES_RESET 표시로 비운다
   - LLM은 검색 결과에서 사실을 뽑기만 하고, 조건 충족 여부는 is_eligible_round() 등 코드로 판정한다
 """
 import re
@@ -17,7 +17,7 @@ from pydantic import BaseModel, Field
 
 from agents.web import format_results, search_many, to_source
 from config import ALLOWED_ROUNDS, LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MAX_CANDIDATES, MODEL_ANALYZE, SEARCH_QUERIES
-from state import RESET_ON_NEXT
+from state import RESET_ON_NEXT, SOURCES_RESET
 
 Listed = Literal["상장", "비상장", "확인불가"]
 Segment = Literal["데이터센터", "엣지", "차량용", "인프라", "기타"]
@@ -158,6 +158,7 @@ def explorer_node(state: dict) -> dict:
     name = candidates[idx]
     result = verify_company(name)
     out = {**RESET_ON_NEXT, "candidates": candidates, **result}
+    out["sources"] = [SOURCES_RESET] + result.get("sources", [])   # 이전 기업 출처는 State에서 비운다
     if not result["is_eligible"]:
         out["rejected"] = [{"company": name, "reason": result["eligibility_reason"], "total": None}]
     return out

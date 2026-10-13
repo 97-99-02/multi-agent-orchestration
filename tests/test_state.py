@@ -57,3 +57,21 @@ def test_parallel_nodes_merge_through_reducers():
     out = g.compile().invoke({})
     assert [s["node"] for s in out["sources"]] == ["market", "team"]
     assert {e["node"] for e in out["agent_errors"]} == {"market", "team"}
+
+
+def test_sources_reset_marker_drops_previous_company_sources():
+    from state import SOURCES_RESET
+    old = [src(company="A사"), src(company="A사", url="https://b.com")]
+    merged = merge_sources(old, [SOURCES_RESET, src(company="B사")])
+    assert [s["company"] for s in merged] == ["B사"]
+    assert SOURCES_RESET not in merged
+
+
+def test_explorer_resets_sources_when_moving_to_next_candidate(monkeypatch):
+    from agents import explorer
+    from state import SOURCES_RESET
+    monkeypatch.setattr(explorer, "verify_company", lambda name: {
+        "company": {"name": name}, "is_eligible": True, "eligibility_reason": "",
+        "sources": [src(company=name, node="explorer")]})
+    out = explorer.explorer_node({"candidates": ["A사", "B사"], "current_index": 1})
+    assert out["sources"][0] == SOURCES_RESET and out["sources"][1]["company"] == "B사"

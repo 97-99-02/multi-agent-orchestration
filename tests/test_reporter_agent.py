@@ -216,6 +216,115 @@ def test_summary_is_not_scaled_and_body_follows_dashboard_overflow(tmp_path, mon
     assert reporter._LAYOUT_SCALE == 1.45
 
 
+def test_field_names_are_translated_but_english_words_kept():
+    body = "'weaknesses' 항목과 public_revenue_contracts 정보, strengths가 없다. Hailo competitive strengths."
+    assert reporter.translate_field_names(body) == "'약점' 항목과 공개 매출·계약 정보, 강점가 없다. Hailo competitive strengths."
+
+
+def test_prompt_rules_for_consistency_and_summary_citations():
+    assert "모든 장에서 같은 값·시점" in reporter.SYSTEM_PROMPT
+    assert "줄마다 끝에 출처 번호" in reporter.SYSTEM_PROMPT
+
+
+# ---------- 지적된 장만 재작성 (2차 피드백 C단계) ----------
+PREV_REPORT = """## SUMMARY
+**결론:** 투자.
+
+## 1. 사업 아이디어·기술 성숙도
+기술 내용[2].
+
+## 5. 경쟁 구도
+| 구분 | 기업 |
+|---|---|
+| 선도 기업 | NVIDIA |
+경쟁 해설[1].
+
+## 6. 투자 판단 결과
+| 항목 | 점수 |
+|---|---|
+판단 해설.
+
+## 7. 사업 리스크
+리스크 설명(확인 필요).
+
+## 8. 한계점
+한계 설명.
+
+### 자동 검증 결과
+- 수치 검증 결과
+
+## REFERENCE
+### 웹페이지
+- [1] 매체A(2026). 기사A.
+- [2] 매체B(2026). 기사B.
+"""
+SOURCES = [{"n": 7, "label": "웹페이지", "text": "매체A(2026). 기사A.", "title": "기사A", "raw": []},
+           {"n": 9, "label": "웹페이지", "text": "매체B(2026). 기사B.", "title": "기사B", "raw": []}]
+
+
+def test_previous_body_restores_citation_numbers_and_strips_added_parts():
+    prev = reporter.previous_body({"report": PREV_REPORT}, SOURCES)
+    assert "기술 내용[9]." in prev and "경쟁 해설[7]." in prev           # REFERENCE 번호 → 출처 목록 번호
+    assert "자동 검증 결과" not in prev                                    # 검증 노드가 다시 붙인다
+    assert "{{COMPETITOR_TABLE}}" in prev and "{{SCORE_TABLE}}" in prev and "| 선도 기업" not in prev
+
+
+def test_flagged_chapters_from_instructions_values_and_marks():
+    prev = reporter.previous_body({"report": PREV_REPORT}, SOURCES)
+    assert reporter.flagged_chapters(prev, "- [편향 통제] 한계점 장에 인용 없음", []) == {"한계점", "사업 리스크"}
+    assert "사업 아이디어·기술 성숙도" in reporter.flagged_chapters(prev, "1장 수치 오류", [])
+    assert "사업 아이디어·기술 성숙도" in reporter.flagged_chapters(prev, "", ["기술 내용"])
+
+
+def test_merge_keeps_unflagged_chapters_from_previous_report():
+    prev = reporter.previous_body({"report": PREV_REPORT}, SOURCES)
+    new = ("## SUMMARY\n새 결론.\n## 1. 사업 아이디어·기술 성숙도\n새 기술 문장(틀림).\n## 5. 경쟁 구도\n{{COMPETITOR_TABLE}}\n새 경쟁 해설[7].\n"
+           "## 6. 투자 판단 결과\n{{SCORE_TABLE}}\n새 판단.\n## 7. 사업 리스크\n새 리스크[7].\n## 8. 한계점\n새 한계.\n")
+    merged = reporter.merge_rewrite(new, prev, {"사업 리스크"})
+    assert "기술 내용[9]." in merged and "새 기술 문장" not in merged      # 지적 안 된 장은 직전 내용
+    assert "새 리스크[7]." in merged                                        # 지적된 장은 새 내용
+    assert "새 경쟁 해설[7]." in merged and "새 판단." in merged            # 표 장은 항상 새 내용
+    assert "**결론:** 투자." in merged and "한계 설명." in merged
+
+
+def test_partial_rewrite_only_after_failed_check_without_research():
+    base = {"report": PREV_REPORT, "report_version": 2}
+    failed = {"report_version": 1, "passed": False, "fix_instructions": "- [중립성] 한계점 장 표현"}
+    _, flagged = reporter.partial_rewrite_plan({**base, "eval_result": failed}, SOURCES)
+    assert flagged == {"한계점", "사업 리스크"}
+    _, after_research = reporter.partial_rewrite_plan({**base, "eval_result": {**failed, "evidence_gaps": {"team": "x"}}}, SOURCES)
+    assert after_research == set()                                          # 재조사 후에는 전체를 새로 쓴다
+    assert reporter.partial_rewrite_plan({"report": PREV_REPORT, "report_version": 1}, SOURCES) == ("", set())
+
+
+def test_reporter_node_rewrites_only_flagged_chapter():
+    prev = ("## SUMMARY\n추천 기업 없음.\n## 1. 평가 개요\n원래 개요.\n## 3. 사업 리스크\n원래 리스크.\n## 4. 한계점\n원래 한계.\n"
+            "\n## REFERENCE\n- (사용한 출처 없음)\n")
+    state = {**HOLD, "report": prev, "report_version": 2,
+             "eval_result": {"report_version": 1, "passed": False, "fix_instructions": "- [중립성] 사업 리스크 장이 100자 미만"}}
+
+    class RewriteLLM:
+        def __init__(self):
+            self.prompts = []
+
+        def invoke(self, messages):
+            self.prompts.append(messages[-1][1])
+            return SimpleNamespace(content="## SUMMARY\n추천 기업 없음.\n## 1. 평가 개요\n바뀐 개요.\n"
+                                           "## 3. 사업 리스크\n고친 리스크.\n## 4. 한계점\n바뀐 한계.\n")
+    llm = RewriteLLM()
+    report = reporter.reporter_node(state, llm=llm)["report"]
+    assert "[부분 재작성]" in llm.prompts[0] and "{{SCORE_TABLE}}" in llm.prompts[0]
+    assert "원래 개요." in report and "원래 한계." in report and "고친 리스크." in report
+
+
+def test_landscape_card_text_is_shortened_to_first_sentence():
+    long = ("Snapdragon processors with integrated NPUs for edge AI. Qualcomm has a 15.6% share of the market "
+            "and keeps expanding into automotive and PC segments with new chips.")
+    assert reporter._short(long, 110) == "Snapdragon processors with integrated NPUs for edge AI."
+    assert reporter._short("가" * 50 + " " + "나" * 80, 110).endswith("…")
+    assert reporter._short("짧은 설명", 110) == "짧은 설명"
+
+
 # ---------- 코드 생성 보조 표 (개발 단계 타임라인, 채점 근거) ----------
 LEVELS = reporter.rubric_levels()
 URL_A, URL_B, URL_C = "https://a.com/1", "https://b.com/2", "https://c.com/3"
@@ -317,6 +426,20 @@ def test_tables_land_in_their_chapters_and_citations_match_reference():
     assert reporter.printed_reference_numbers(report) == {1, 2, 3}
     assert not verifier.check_citations(report)
     assert reporter.check_format(report) == []
+
+
+def test_partial_rewrite_does_not_duplicate_code_tables():
+    # 1장은 직전 내용으로 되돌아가므로 직전 보고서의 타임라인을 빼 두지 않으면 표가 둘이 된다
+    prev = reporter.previous_body({"report": assembled()}, [dict(s) for s in TABLE_SOURCES])
+    assert not any(c in prev for c in reporter.CODE_TABLE_CAPTIONS)
+    assert f"| {reporter.TIMELINE_HEADER} |" not in prev and "기술 본문[2]." in prev
+    new = ("## SUMMARY\n요약.\n## 1. 사업 아이디어·기술 성숙도\n새 기술.\n## 2. 시장성\n새 시장.\n"
+           "## 6. 투자 판단 결과\n{{SCORE_TABLE}}\n새 해설.\n## 7. 사업 리스크\n고친 리스크.\n")
+    merged = reporter.merge_rewrite(new, prev, {"사업 리스크"})
+    state = {"company": {"name": "A사"}, "tech_summary": TECH, "scores": SCORES}
+    report = reporter.assemble_report(state, merged, [dict(s) for s in TABLE_SOURCES])
+    assert "기술 본문" in report and "새 기술." not in report               # 1장은 직전 내용
+    assert all(report.count(c) == 1 for c in reporter.CODE_TABLE_CAPTIONS)
 
 
 def test_rubric_wording_in_tables_is_not_flagged_by_verifier():

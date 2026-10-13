@@ -263,3 +263,48 @@ def test_web_evidence_all_on_same_day_needs_independent_sources():
     other_day = same_day[:1] + [{**same_day[1], "date": "2026-10-07"}]
     nxt, _, _ = decide(analyzed(sources=[s for s in good_sources() if s["node"] != "team"] + other_day))
     assert nxt == ["judge"]
+
+
+
+# ---------- 근거 부족 → 관점 재조사 ----------
+def failed_eval(gaps, version=1):
+    return {"report_version": version, "passed": False, "items": {"bias_control": {"passed": False}},
+            "evidence_gaps": gaps}
+
+
+def test_quality_evidence_gap_routes_to_research():
+    state = report_state(verify_result={"report_version": 1, "passed": True},
+                         eval_result=failed_eval({"team": "같은 날 보도뿐"}))
+    nxt, why, upd = decide(state)
+    assert nxt == ["team"] and "관점 재조사 1/1" in why
+    assert upd["reopen_stage"] == "research" and upd["research_loops"] == 1 and upd["quality_loops"] == 1
+    assert upd["rework_request"]["team"]["reason"].startswith("품질 평가:")
+    assert upd["rework_request"]["team"]["focus"] == sup.RESEARCH_FOCUS["team"]   # 충분성 판정은 통과했던 관점
+
+
+def test_research_loop_limit_falls_back_to_rewrite():
+    state = report_state(verify_result={"report_version": 1, "passed": True}, research_loops=1,
+                         eval_result=failed_eval({"team": "같은 날 보도뿐"}))
+    nxt, _, upd = decide(state)
+    assert nxt == ["reporter"] and upd == {"quality_loops": 1, "report_version": 2}
+
+
+def test_reopen_research_then_rejudge():
+    nxt, _, upd = decide(report_state(reopen_stage="research"))
+    assert nxt == ["judge"] and upd["reopen_stage"] == "judge" and upd["rework_request"] == {}
+
+
+def test_reopen_rejudge_invest_rewrites_report():
+    nxt, why, upd = decide(report_state(reopen_stage="judge", report_version=1))
+    assert nxt == ["reporter"] and upd == {"reopen_stage": None, "report_version": 2}
+    assert "재판단 투자" in why
+
+
+def test_reopen_rejudge_hold_moves_on_or_writes_no_recommendation():
+    nxt, why, upd = decide(report_state(reopen_stage="judge", scores={"decision": "보류", "total": 62}))
+    assert nxt == ["explorer"] and upd["current_index"] == 1 and upd["reopen_stage"] is None
+    assert upd["research_loops"] == 0 and upd["quality_loops"] == 0
+    last = report_state(reopen_stage="judge", scores={"decision": "보류", "total": 62}, current_index=1,
+                        company={"name": "B사"})
+    nxt, why, _ = decide(last)
+    assert nxt == ["reporter"] and "추천 기업 없음" in why
