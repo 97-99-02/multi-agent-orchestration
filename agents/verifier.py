@@ -705,6 +705,12 @@ def rag_check(report: str, state: dict, retriever, judge_llm) -> tuple[list[dict
 # ═════════════════════════════════════════════════════════════
 # 끝내 안 맞을 때의 처리
 # ═════════════════════════════════════════════════════════════
+def _in_rubric_cell(text: str, pos: int, surface: str) -> bool:
+    """pos가 기준표 문구를 옮긴 표 줄('|'로 시작) 안이고 표현이 기준표에 있는가 (find_wording_problems의 예외와 같은 기준)."""
+    line = text[text.rfind("\n", 0, pos) + 1:]
+    return line.startswith("|") and surface in RUBRIC
+
+
 def mark_unverified(report: str, mismatches: list[dict]) -> str:
     """끝내 안 맞는 표현 옆에 '(확인 필요)'를 붙인다. (설계 문서: 재작성 후에도 불일치 시)
 
@@ -720,11 +726,14 @@ def mark_unverified(report: str, mismatches: list[dict]) -> str:
             m["marked"] = m["surface"] in head
             head = head.replace(m["surface"], MARK_BAD_CITATION)
             continue
-        # 같은 표현의 첫 등장 한 곳에만 표시. 앞뒤가 숫자인 경우(1200 속의 120)는 건너뛴다
+        # 같은 표현의 첫 등장 한 곳에만 표시. 앞뒤가 숫자인 경우(1200 속의 120)는 건너뛴다.
+        # 기준표 원문을 옮긴 표 칸('수십억 달러 이상 규모')은 검사에서 빼므로 표시도 건너뛰고 본문 쪽에 붙인다
         pattern = re.compile(r"(?<![\d.,])" + re.escape(m["surface"])
                              + r"(?![\d])(?!" + re.escape(MARK_UNVERIFIED) + ")")
-        head, count = pattern.subn(lambda x: x.group(0) + MARK_UNVERIFIED, head, count=1)
-        m["marked"] = m.get("marked", False) or bool(count)
+        target = next((x for x in pattern.finditer(head) if not _in_rubric_cell(head, x.start(), m["surface"])), None)
+        if target:
+            head = head[:target.end()] + MARK_UNVERIFIED + head[target.end():]
+        m["marked"] = m.get("marked", False) or bool(target)
     return head + sep + tail
 
 

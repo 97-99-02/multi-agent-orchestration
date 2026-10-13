@@ -95,3 +95,54 @@ def test_sns_posts_are_secondary(pages):
     assert not web.is_secondary("https://dx.com/a")                 # 'x.com'으로 끝나는 다른 도메인은 아니다
     pages[post] = f"<p>{CLAIM}</p>"                                  # 원본 링크가 없는 게시물은 뺀다
     assert web.resolve_secondary([{"url": post, "title": "[공시분석]", "content": CLAIM}]) == []
+
+
+# ---------- Tavily 요청 한도(429) ----------
+class FakeTavily:
+    """invoke마다 미리 정한 응답을 차례로 돌려준다."""
+    replies: list = []
+    calls = 0
+
+    def __init__(self, **kwargs):
+        pass
+
+    def invoke(self, _):
+        FakeTavily.calls += 1
+        return FakeTavily.replies.pop(0)
+
+
+LIMIT = {"error": "Error 429: Your request has been blocked due to excessive requests."}
+
+
+def test_tavily_retries_on_rate_limit_then_succeeds(monkeypatch):
+    waits = []
+    monkeypatch.setattr(web, "TavilySearch", FakeTavily)
+    monkeypatch.setattr(web.time, "sleep", waits.append)
+    FakeTavily.replies, FakeTavily.calls = [LIMIT, LIMIT, {"results": [{"url": "u"}]}], 0
+    assert web._tavily("q") == [{"url": "u"}]
+    assert waits == list(web.TAVILY_RETRY_WAITS[:2]) and FakeTavily.calls == 3
+
+
+def test_tavily_gives_up_after_retries_and_does_not_retry_other_errors(monkeypatch):
+    monkeypatch.setattr(web, "TavilySearch", FakeTavily)
+    monkeypatch.setattr(web.time, "sleep", lambda s: None)
+    FakeTavily.replies = [LIMIT] * (len(web.TAVILY_RETRY_WAITS) + 1)
+    with pytest.raises(RuntimeError, match="429"):
+        web._tavily("q")
+    FakeTavily.replies, FakeTavily.calls = [{"error": "Error 432: usage limit"}], 0
+    with pytest.raises(RuntimeError, match="432"):
+        web._tavily("q")
+    assert FakeTavily.calls == 1                                   # 사용량 초과는 기다려도 풀리지 않는다
+    FakeTavily.replies, FakeTavily.calls = [LIMIT], 0
+    with pytest.raises(RuntimeError):
+        web._tavily("q", retry=False)                              # 보조 검색은 기다리지 않는다
+    assert FakeTavily.calls == 1
+
+
+def test_title_search_has_a_per_run_limit(monkeypatch):
+    calls = []
+    monkeypatch.setattr(web, "_tavily", lambda *a, **k: calls.append(k.get("retry")) or [])
+    monkeypatch.setattr(web, "_title_searches", 0)
+    for i in range(web.TITLE_SEARCH_LIMIT + 3):
+        web._original_by_title(f"충분히 긴 기사 제목 {i} - 언론사")
+    assert len(calls) == web.TITLE_SEARCH_LIMIT and set(calls) == {False}

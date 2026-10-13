@@ -75,7 +75,8 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
    - 추가 확인이 필요한 사항 (1~2개). 점수를 다시 쓰는 것이 아니라 무엇을 확인해야 하는지 씁니다.
      [분석 자료]에 summary_caution이 있으면 그 내용(항목명, 점수, 확인할 다음 점수 조건)을 한 항목으로 반드시 포함합니다.
      항목명·점수는 summary_caution에 적힌 값을 그대로 씁니다. summary_caution이 없으면 그 항목은 쓰지 않고 항목 점수도 쓰지 않습니다.
-     보고서 어디에서든 항목 점수를 쓸 때는 scores의 점수와 같아야 합니다.
+     보고서 어디에서든 항목 점수를 쓸 때는 scores의 점수와 같아야 합니다. 채점 항목은 점수표의 6개뿐이고 점수는 1~5점입니다.
+     약점·강점 같은 다른 이름에 점수를 붙이지 않습니다.
    [분석 자료]의 키 이름(summary_caution, team_analysis 등)은 본문 어디에도 쓰지 않습니다.
 6. 'REFERENCE' 장은 쓰지 않습니다. (코드가 실제 사용 출처로 자동 첨부합니다.)
 7. 본문 전체는 한글 기준 약 10,000~14,000자로 씁니다. (PDF는 대시보드·REFERENCE 포함 7~10장)
@@ -804,6 +805,21 @@ def score_claim_mismatches(report: str, scores: dict) -> list[dict]:
 COMPETITION_PARTS = ("**확인된 사실**", "**비교 결과**", "**투자 관점 해석**")   # 5장 세 부분 (규칙 22)
 
 
+# 채점 점수는 1~5점이라 '0점'은 근거 없는 점수다 ('환산 점수 70.0점'·'10점'의 0은 앞 숫자에 붙어 있어 제외)
+INVALID_SCORE_PATTERN = re.compile(r"(?<![\d.,])0\s*점")
+
+
+def invalid_score_claims(report: str) -> list[str]:
+    """본문의 '0점' 표기와 앞 문맥. 품질 미달 수정 지시('약점을 쓰라')를 받은 LLM이 채점 항목도 아닌
+    '약점 항목 점수 0점'을 지어 쓴 적이 있다 (채점 항목 이름이 아니라 항목별 점수 대조로는 잡히지 않았다)."""
+    body = report.partition(REFERENCE_HEADING)[0]
+    found = []
+    for m in INVALID_SCORE_PATTERN.finditer(body):
+        line_start = body.rfind("\n", 0, m.start()) + 1   # 앞 문맥은 같은 줄 안에서만 (글머리 기호는 뗀다)
+        found.append(body[max(line_start, m.start() - 25):m.end()].lstrip("-*• ").strip())
+    return found
+
+
 def check_format(report: str, structured_summary: bool = False,
                  summary_names: list[str] | tuple = (), summary_cautions: list[str] | tuple = (),
                  scores: dict | None = None) -> list[str]:
@@ -852,6 +868,9 @@ def check_format(report: str, structured_summary: bool = False,
     limit = PAGE_CHARS * MAX_PAGES
     if len(report) > limit:
         violations.append(f"전체 분량이 {len(report)}자로 {MAX_PAGES}장 기준({limit}자)을 넘습니다. 줄이세요.")
+    for context in invalid_score_claims(report) if scores else []:
+        violations.append(f"'{context}'의 0점은 채점 결과에 없는 점수입니다. 채점 항목은 점수표의 6개(1~5점)뿐이니 "
+                          f"이 점수를 지우세요.")
     for m in score_claim_mismatches(report, scores or {}):
         violations.append(f"'{m['surface']}'는 점수표의 실제 점수({m['label']} {m['actual']}점)와 다릅니다. "
                           f"점수는 점수표와 같게 쓰고, 근거 없는 점수는 쓰지 마세요.")

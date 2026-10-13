@@ -6,6 +6,8 @@
 import html as html_lib
 import logging
 import re
+import threading
+import time
 import urllib.request
 from datetime import date, timezone
 from email.utils import parsedate_to_datetime
@@ -24,9 +26,20 @@ def search(query: str, max_results: int = 8, topic: str = "news") -> list[dict]:
     return resolve_secondary(_tavily(query, max_results, topic))
 
 
-def _tavily(query: str, max_results: int = 8, topic: str = "news") -> list[dict]:
-    """Tavily 검색 원본 결과 (2차 출처 처리 전)."""
-    response = TavilySearch(max_results=max_results, topic=topic).invoke({"query": query})
+# 429(분당 요청 한도)일 때 기다렸다 다시 검색하는 간격(초). 분석 노드 4개가 동시에 검색하다 개발용 키 한도에 걸려
+# 기업 하나가 근거 없이 채점되고 다음 후보 탐색까지 실패한 적이 있다. 한도는 분 단위라 조금 기다리면 풀린다
+TAVILY_RETRY_WAITS = (5, 15, 30)
+
+
+def _tavily(query: str, max_results: int = 8, topic: str = "news", retry: bool = True) -> list[dict]:
+    """Tavily 검색 원본 결과 (2차 출처 처리 전). retry=False면 429에서 기다리지 않고 바로 실패한다."""
+    for wait in (*(TAVILY_RETRY_WAITS if retry else ()), None):
+        response = TavilySearch(max_results=max_results, topic=topic).invoke({"query": query})
+        if wait is not None and isinstance(response, dict) and "429" in str(response.get("error", "")):
+            logger.warning("[웹] Tavily 요청 한도(429) → %d초 뒤 다시 검색: %s", wait, query)
+            time.sleep(wait)
+            continue
+        break
     # 결과가 0건이면 langchain-tavily가 ToolException을 문자열로 돌려준다(handle_tool_error=True).
     # 작은 스타트업의 좁은 검색어에서 자주 생기며, 오류가 아니라 '결과 없음'으로 처리한다
     if isinstance(response, str):
@@ -171,6 +184,11 @@ _SOURCE_CONTEXT = re.compile(r"(?:출처|원문|source|via)\s*[:：]?\s*$", re.I
 _FACT = re.compile(r"\d[\d,.]*\s*(?:조|억|만|천)?\s*(?:원|달러|%|배|명|개|나노|nm|TOPS|W)|\d{4}년|\d{2,}[\d,.]*")
 _WORD = re.compile(r"[가-힣A-Za-z][가-힣A-Za-z0-9]{1,}")
 MAX_ORIGINAL_CANDIDATES = 2   # 2차 출처 하나에서 따라가 볼 원본 링크 수
+# 원문 링크가 없는 포털 재전송의 원본을 찾으려고 더 하는 제목 검색 수 (실행 한 번 기준). 검색 호출이 늘어
+# 검색 API 분당 한도(429)에 걸린 적이 있어 상한을 두고, 넘으면 포털 기사를 그대로 둔다
+TITLE_SEARCH_LIMIT = 8
+_title_searches = 0
+_title_lock = threading.Lock()
 EXCERPT_CHARS = 1500          # 원본에서 옮길 본문 길이 (Tavily content와 비슷한 분량)
 
 
@@ -276,11 +294,16 @@ def excerpt(secondary: str, original: str, limit: int = EXCERPT_CHARS) -> str:
 
 def _original_by_title(title: str) -> list[str]:
     """원문 링크가 없는 포털 재전송: 같은 제목 기사를 검색해 원본 언론사 기사 후보를 찾는다."""
+    global _title_searches
     core = re.sub(r"\s*[-|:]\s*[^-|:]+$", "", title).strip() or title   # 제목 끝 ' - 언론사' 제거
     if len(core) < 8:
         return []
-    try:
-        results = _tavily(core, max_results=5, topic="general")
+    with _title_lock:   # 분석 노드가 병렬로 검색하므로 상한 계산을 잠근다
+        if _title_searches >= TITLE_SEARCH_LIMIT:
+            return []
+        _title_searches += 1
+    try:   # 보조 검색이라 429에서 기다리지 않는다 (본 검색의 한도를 쓰지 않게)
+        results = _tavily(core, max_results=5, topic="general", retry=False)
     except Exception:  # noqa: BLE001 - 검색 실패는 원본 미확인으로 처리한다
         return []
     words = set(_WORD.findall(core))

@@ -116,3 +116,21 @@ def test_quality_note_translates_internal_names():
     note = quality.add_quality_note("## 8. 한계점\n본문.\n\n" + reporter.REFERENCE_HEADING + "\n- [1] x", items)
     assert not [w for w in quality.INTERNAL_NAMES if w in note] and "missing_fields" not in note and ": true" not in note
     assert "기술 요약.약점 필드" in note
+
+
+# ---------- 채점 항목 밖 점수('약점 0점')와 기준표 칸 표시 ----------
+def test_format_check_flags_zero_score_on_non_item():
+    from agents import reporter
+    report = ("## SUMMARY\n**확인 필요**\n- 약점(weaknesses) 항목 점수 0점, 다음 조건 확인 필요\n"
+              "## 6. 투자 판단 결과\n환산 점수 70.0점, 10점 만점 아님\n## REFERENCE\n")
+    assert reporter.invalid_score_claims(report) == ["약점(weaknesses) 항목 점수 0점"]
+    assert any("0점은 채점 결과에 없는 점수" in v for v in reporter.check_format(report, scores=ITEM_SCORES))
+    assert not reporter.invalid_score_claims("환산 점수 70.0점이고 100점 만점이다.")
+
+
+def test_unverified_mark_skips_rubric_table_cell():
+    report = ("## 6. 투자 판단 결과\n| 시장성 | 5/5 | 수십억 달러 이상 규모, 연평균 성장률 20% 이상 | – |\n\n"
+              "시장성 5점은 수십억 달러 규모와 성장률에 근거한다.\n## REFERENCE\n")
+    marked = verifier.mark_unverified(report, [{"kind": "spelled", "value": "십억 달러", "surface": "십억 달러"}])
+    assert "수십억 달러 이상 규모" in marked and "| 수십억 달러(확인 필요)" not in marked
+    assert "수십억 달러(확인 필요) 규모와" in marked
