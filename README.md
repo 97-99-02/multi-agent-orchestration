@@ -53,52 +53,74 @@
 
 ## Architecture
 
-**설계 그래프** (설계 문서 4.1, 노드 안 흐름 포함 · 그림: `assets/graph_design.png`)
+**Supervisor 라우팅** (`agents/supervisor.py`의 라우팅 규칙. 모든 화살표는 하위 노드 → supervisor → 다음 노드다)
 
 ```mermaid
 graph TD
-    START([시작]) --> A[스타트업 탐색<br/>후보 발굴 + 기업별 조건 확인]
-    A -->|조건 미충족| NEXT{남은 후보?}
-    A -->|조건 충족| B[기술 요약<br/>웹: 기업 사실 / RAG: 업계 해석]
-    A -->|조건 충족| C[시장성 평가<br/>RAG: 시장 문서, 부족하면 기술 문서]
-    A -->|조건 충족| D[경쟁사 비교<br/>웹 검색 + 상장 여부 판정]
-    A -->|조건 충족| E[팀 분석<br/>웹 검색]
-    B --> F
-    C --> F
-    D --> F
-    E --> F
-    subgraph J[투자 판단]
-        F[평가표 채점 LLM<br/>+ 환산 점수·결정 규칙] --> F2{같은 기업 과거 평가와<br/>결정이 다르거나 5점 이상 차이?}
-        F2 -->|예| F3[seed를 바꿔 2회 재채점<br/>항목별 중앙값으로 다시 계산]
-        F2 -->|아니오| DEC{투자 / 보류}
-        F3 --> DEC
-    end
-    DEC -->|투자| G[보고서 생성]
-    DEC -->|보류| NEXT
-    NEXT -->|있음| A
-    NEXT -->|없음| G
-    G --> H[사실 검증<br/>수치 대조 + RAG 원문 대조 + LLM 검수]
-    H -->|통과| END([종료])
-    H -->|불일치, 재작성 1회| G
-    H -->|재작성 후에도 불일치| END2([확인 필요 표시 후 종료])
+    START([시작]) --> EX[explorer<br/>첫 호출: 후보 발굴 최대 5곳<br/>매 호출: 현재 후보 조건 확인]
+    EX --> C1{조건 충족?<br/>비상장 · Seed~Series C · Exit 전}
+    C1 -->|아니오| NEXT{남은 후보?}
+    C1 -->|예| PAR[[미수집 관점 병렬 실행<br/>tech_summary · market · competitor · team]]
+    PAR --> EV{관점별 근거 충분?<br/>필수 항목 · 발행처 2곳 이상 · 같은 날 보도만은 아님}
+    EV -->|부족, 재작업 1회 전| RW[[부족한 관점만 재작업<br/>rework_request: 사유 · 보완 대상]]
+    RW --> EV
+    EV -->|충분, 또는 재작업 한도| JD[judge<br/>평가표 채점 + 결정 규칙]
+    JD -->|보류| NEXT
+    NEXT -->|있음| EX
+    JD -->|투자| RP[reporter<br/>보고서 vN 작성]
+    NEXT -->|없음| RP
+    RP --> VF[verifier<br/>수치 대조 · RAG 원문 대조 · LLM 검수]
+    VF -->|불일치, 재작성 1회 전| RP
+    VF -->|통과, 또는 확인 필요 표시 후 확정| QE[quality_eval<br/>Groundedness · 중립성 · 편향 통제]
+    QE -->|미달, 재작성 2회 전| RP
+    QE -->|통과| END([종료])
+    QE -->|미달, 한도 도달| END2([미달 항목을 한계점에 남기고 종료])
 ```
 
 | 구조 | 동작 |
 |---|---|
-| 조건 분기 1 (탐색 후) | 기업별 재검색으로 상장 여부·투자 단계를 다시 확인하고, 조건 미충족이면 분석 없이 다음 후보로 |
-| 병렬 실행 | 기술 요약·시장성 평가·경쟁사 비교·팀 분석을 동시에 실행, 넷이 끝나면 투자 판단 |
+| 라우팅 | 모든 하위 노드는 실행 후 supervisor로 돌아오고, supervisor가 State(수집된 관점, 근거 충분도, 판단 결과, 보고서 검증 결과)를 보고 다음 노드를 정한다. 분기는 `add_conditional_edges` 하나이고, 결정과 사유는 `outputs/decisions/{trace_id}.jsonl`에 남는다 |
+| 병렬 실행 | 아직 수집하지 않은 관점(또는 재작업할 관점)을 한 단계에 함께 실행하고, 모두 끝나면 supervisor가 한 번 판단한다 |
+| 근거 충분성 판정 | 기술 요약은 핵심 칩·개발 단계·성능 수치·공개 매출·계약, 시장성은 세부 분야 시장 규모·성장률, 팀은 창업자·핵심 인력, 경쟁사는 같은 세부 분야 경쟁사가 있어야 한다. 관점마다 근거 발행처가 2곳 이상이고, 웹 근거가 모두 같은 날 보도면 안 된다 |
+| 재작업 | 근거가 부족한 관점만 사유·보완 대상과 함께 다시 부른다(관점당 1회). 에이전트는 첫 실행과 다른 검색어로 찾고 이미 확인한 사실은 유지한다. 한도에 걸리면 정보 부족인 채로 판단한다(해당 항목 최대 2점) |
 | 노드 안 재검색 | 기술 요약: 비어 있는 항목만 검색어를 바꿔 한 번 더 검색 / 시장성: 세부 분야 수치가 없으면 기술 문서까지 검색 |
 | 투자 판단 안 일관성 검증 | 같은 기업·같은 평가 버전의 과거 기록(`outputs/judge_log.jsonl`)과 결정이 다르거나 5점 이상 차이 나면 seed를 바꿔 2회 재채점, 항목별 중앙값 사용 |
-| 조건 분기 2 (투자 판단 후) | 투자면 보고서 생성, 보류면 다음 후보로. 후보는 최대 5개라 반복은 최대 5회 |
-| 조건 분기 3 (사실 검증 후) | 불일치면 1회 재작성, 그래도 불일치면 해당 표현에 "(확인 필요)" 표시 후 종료 |
+| 다음 후보 | 조건 미충족이나 보류면 다음 후보로 넘어간다(최대 5곳). 후보를 모두 평가해도 투자 기업이 없으면 '추천 기업 없음' 보고서를 쓴다 |
+| 사실 검증 루프 | 불일치면 1회 재작성, 그래도 불일치면 해당 표현에 "(확인 필요)"를 표시하고 확정한 뒤 품질 평가로 |
+| 품질 평가 루프 | 미달이면 미달 사유를 수정 지시로 넘겨 재작성(최대 2회). 한도에 도달하면 미달 항목을 보고서 한계점에 남기고 종료 |
+| 오류 처리 | 하위 노드 예외는 노드별 대체 결과로 바꿔 supervisor가 다음을 정한다. 분석 노드 실패는 재작업 1회, 탐색 오류는 다음 후보, 판단 오류는 보류로 처리한다 |
+| 종료 보장 | supervisor 실행 40회 상한(보고서가 없으면 지금까지 결과로 작성 후 종료), LangGraph `recursion_limit` 90 |
 
 **코드에서 생성한 그래프** (`graph.py`를 LangGraph `get_graph().draw_mermaid()`로 그린 것, 점선은 조건부 분기)
 
-![graph](assets/graph_code.png)
+```mermaid
+graph TD
+    __start__([__start__]) --> supervisor
+    supervisor -.-> explorer
+    supervisor -.-> tech_summary
+    supervisor -.-> market
+    supervisor -.-> competitor
+    supervisor -.-> team
+    supervisor -.-> judge
+    supervisor -.-> reporter
+    supervisor -.-> verifier
+    supervisor -.-> quality_eval
+    supervisor -.-> __end__([__end__])
+    explorer --> supervisor
+    tech_summary --> supervisor
+    market --> supervisor
+    competitor --> supervisor
+    team --> supervisor
+    judge --> supervisor
+    reporter --> supervisor
+    verifier --> supervisor
+    quality_eval --> supervisor
+```
 
-노드 이름: explorer(스타트업 탐색), tech_summary(기술 요약), market(시장성 평가), competitor(경쟁사 비교),
-team(팀 분석), judge(투자 판단), reporter(보고서 생성), verifier(사실 검증).
-explorer → explorer는 조건 미충족 시 다음 후보, explorer → reporter는 후보를 모두 평가한 경우다.
+하위 노드끼리 연결된 간선이 없고, 모든 노드는 supervisor로만 돌아간다(Star 구조). 다시 그리기: `uv run python -c "from graph import build_graph; print(build_graph().get_graph().draw_mermaid())"`
+
+노드 이름: supervisor(조정), explorer(스타트업 탐색), tech_summary(기술 요약), market(시장성 평가), competitor(경쟁사 비교),
+team(팀 분석), judge(투자 판단), reporter(보고서 생성), verifier(사실 검증), quality_eval(품질 평가).
 
 ## 투자 판단 기준
 
@@ -172,7 +194,6 @@ explorer → explorer는 조건 미충족 시 다음 후보, explorer → report
 │   ├── embedding/    # 임베딩 후보 비교 실험 (스크립트, 평가 질문, 결과)
 │   └── market/       # 시장성 평가 정답지, 평가 스크립트, 결과
 ├── tests/            # 단위 테스트 (API 키 없이 실행)
-├── assets/           # README 그림
 ├── outputs/          # 생성된 보고서 (마크다운, PDF), 채점 로그
 ├── state.py          # 공용 State 정의
 ├── graph.py          # LangGraph 흐름
