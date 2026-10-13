@@ -41,6 +41,7 @@ from reportlab.platypus import (CondPageBreak, KeepTogether, PageBreak, Paragrap
                                 TableStyle)
 from reportlab.platypus.doctemplate import LayoutError
 
+from agents.judge import RUBRIC
 from config import (ALLOWED_ROUNDS, CORE_CAUTION_SCORE, CORE_ITEMS, CORE_MIN_SCORE, INVEST_THRESHOLD,
                     MAX_CANDIDATES, MODEL_ANALYZE)
 from config import WEIGHTS as TEAM_WEIGHTS
@@ -217,6 +218,7 @@ REFERENCE_HEADING = "## REFERENCE"
 PLACEHOLDER = "{{SCORE_TABLE}}"                      # AI가 쓰는 '표 자리' 표시
 COMPETITOR_PLACEHOLDER = "{{COMPETITOR_TABLE}}"      # 5장 경쟁사 표 자리
 CANDIDATE_PLACEHOLDER = "{{CANDIDATE_TABLE}}"        # '추천 기업 없음' 보고서 2장 후보 표 자리
+SECTION1_PATTERN = re.compile(r"^##\s*1\.[^\n]*\n", re.MULTILINE)   # 1장 기술 성숙도
 SECTION2_PATTERN = re.compile(r"^##\s*2\.[^\n]*\n", re.MULTILINE)
 COMPETITOR_SECTION_PATTERN = re.compile(r"^##\s*5\.[^\n]*\n", re.MULTILINE)   # 5장 경쟁 구도
 SCORE_SECTION_PATTERN = re.compile(r"^##\s*6\.[^\n]*\n", re.MULTILINE)        # 6장 투자 판단 결과
@@ -228,6 +230,15 @@ PEER_TIER = "동급 기업"                               # 오른쪽(직접 경
 TARGET_TIER = "평가 대상"
 LANDSCAPE_HEADER = "구분"                             # 경쟁 구도 표의 첫 칸 제목 (PDF는 이 표를 구도 그림으로 그린다)
 STRENGTH_HEADER, RISK_HEADER = "차별점(강점)", "경쟁 리스크"   # 2칸 패널로 그리는 표의 제목
+# 코드가 State로 만드는 보조 표의 첫 칸 제목 (PDF 열 폭 TABLE_FRACS의 키이기도 하다)
+TIMELINE_HEADER = "보도일"                            # 1장 개발 단계 타임라인
+RUBRIC_POSITION_HEADER = "채점 항목"                  # 6장 기준표 대비 위치
+SCORE_BASIS_HEADER = "판단 항목"                      # 6장 항목별 판단 근거
+TIMELINE_CAPTION = "**개발 단계 보도 시점** (기사 게시일 순, 사건 시점과 다를 수 있음)"
+RUBRIC_POSITION_CAPTION = "**기준표 대비 위치** (현재 점수 구간과 다음 점수 조건)"
+SCORE_BASIS_CAPTION = "**항목별 판단 근거**"
+MIN_TIMELINE_ROWS = 2        # 1행이면 시점 비교가 안 되어 타임라인을 넣지 않는다
+MAX_TABLE_CITATIONS = 4      # 표 출처 칸에 보일 최대 번호 수 (많으면 칸이 번호로 가득 찬다)
 REFERENCE_SECTION_PATTERN = re.compile(r"\n?##\s*REFERENCE.*", re.DOTALL | re.IGNORECASE)
 H2_PATTERN = re.compile(r"^##\s+(.+?)\s*$", re.MULTILINE)
 TABLE_UNAVAILABLE = "(채점 항목이 누락되어 점수표를 만들 수 없습니다.)"
@@ -436,6 +447,108 @@ def insert_competitor_table(body: str, state: dict) -> str:
     """5장의 자리표시자를 경쟁사 표로 바꾼다. 자리표시자가 없으면 5장 제목 아래에 넣는다.
     (경쟁사 출처 번호는 표 아래 해설 문장에 보고서 LLM이 붙인다. 번호만 나열한 줄은 사실 검증이 주장 없는 문장으로 잡았다)"""
     return _insert_table(body, COMPETITOR_PLACEHOLDER, build_competitor_table(state), COMPETITOR_SECTION_PATTERN, "경쟁사 표")
+
+
+def _citations_for_urls(sources: list[dict], urls: list[str]) -> str:
+    """url들에 해당하는 collect_sources 번호를 '[n][m]'으로. 못 찾은 url은 건너뛴다 (표의 출처 칸)."""
+    by_url = {}
+    for s in sources:
+        for raw in s.get("raw", []):
+            if raw.get("url"):
+                by_url.setdefault(raw["url"], s["n"])
+    numbers = list(dict.fromkeys(by_url[u] for u in urls if u in by_url))[:MAX_TABLE_CITATIONS]
+    return " ".join(f"[{n}]" for n in numbers)   # 띄어 써야 PDF 좁은 칸에서 번호 중간이 아니라 번호 사이에서 줄이 바뀐다
+
+
+def _source_cell(sources: list[dict], urls: list[str]) -> str:
+    """표 출처 칸. 보고서 출처 번호라서 _cell을 거치지 않는다 (_cell은 [n]을 에이전트 검색 번호로 보고 지운다)."""
+    return _citations_for_urls(sources, urls) or "–"
+
+
+def build_timeline_table(state: dict, sources: list[dict]) -> str | None:
+    """1장 개발 단계 타임라인: tech_summary 근거 중 개발 단계 주장을 기사 게시일 순으로. 없으면 None.
+
+    왜: 시점이 다른 기사의 개발 단계 문장이 본문 한 문단에 섞이면 양산 시점이 서로 모순돼 보인다.
+    날짜는 사건 시점이 아니라 기사 게시일이라 제목을 '보도일'로 둔다.
+    """
+    evidence = (state.get("tech_summary") or {}).get("evidence") or []
+    rows, seen = [], set()
+    for e in evidence:
+        if isinstance(e, dict) and e.get("field") == "development_stage" and e.get("text") and e["text"] not in seen:
+            seen.add(e["text"])   # 같은 문장이 여러 출처로 기록되면 처음 것만
+            rows.append(e)
+    if len(rows) < MIN_TIMELINE_ROWS:
+        return None
+    rows.sort(key=lambda e: (not e.get("date"), e.get("date") or ""))   # 날짜 미상은 맨 뒤
+    lines = [TIMELINE_CAPTION, "", f"| {TIMELINE_HEADER} | 내용 | 출처 |", "|---|---|---|"]
+    lines += [f"| {_cell(e.get('date') or UNKNOWN_DATE)} | {_cell(e['text'])} "
+              f"| {_source_cell(sources, [e.get('url', '')])} |" for e in rows]
+    return "\n".join(lines)
+
+
+def rubric_levels() -> dict[str, list[str]]:
+    """judge.RUBRIC 표를 {영문 항목 키: [1점 문구, …, 5점 문구]}로 읽는다. 기준표 원문은 judge.py 한곳에만 둔다."""
+    levels = {}
+    for line in RUBRIC.splitlines()[2:]:   # 제목 줄과 구분선 다음부터
+        cells = [c.strip() for c in line.strip().strip("|").split("|")]
+        levels[cells[0].split()[0]] = cells[1:]
+    return levels
+
+
+def build_score_basis_tables(scores: dict, sources: list[dict]) -> str | None:
+    """6장 점수표 아래: ① 기준표 대비 위치(현재 구간·다음 점수 조건) ② 항목별 판단 근거·출처. 채점 항목이 없으면 None.
+
+    왜: 점수표만으로는 '왜 5점이 아니라 4점인가'가 안 보인다. 기준표 문구로 보여 주면 결정을 점수·기준으로만 설명한다.
+    한 표에 6칸을 넣으면 A4에서 근거 칸이 너무 좁아 두 표로 나눈다.
+    """
+    items, levels = scores.get("items") or {}, rubric_levels()
+    position, basis = [], []
+    for key, label in ITEM_LABELS.items():
+        info = items.get(key)
+        score = info.get("score") if isinstance(info, dict) else None
+        if not isinstance(score, (int, float)) or not 1 <= score <= SCORE_MAX or key not in levels:
+            continue
+        score = int(score)
+        upper = levels[key][score] if score < SCORE_MAX else "–"
+        position.append(f"| {label} | {score}/{SCORE_MAX} | {_cell(levels[key][score - 1])} | {_cell(upper)} |")
+        evidence = str(info.get("evidence") or "")
+        if info.get("insufficient"):
+            evidence = f"(정보 부족으로 최대 {INSUFFICIENT_MAX_SCORE}점) {evidence}"
+        urls = [s.get("url", "") for s in info.get("sources") or [] if isinstance(s, dict)]
+        basis.append(f"| {label} | {_cell(evidence)} | {_source_cell(sources, urls)} |")
+    if not position:
+        return None
+    return "\n".join([RUBRIC_POSITION_CAPTION, "",
+                      f"| {RUBRIC_POSITION_HEADER} | 점수 | 해당 기준 | 다음 점수 조건 |", "|---|---|---|---|",
+                      *position, "", SCORE_BASIS_CAPTION, "",
+                      f"| {SCORE_BASIS_HEADER} | 판단 근거 | 출처 |", "|---|---|---|", *basis])
+
+
+def _append_to_section(body: str, section: re.Pattern, block: str, name: str) -> str:
+    """장 끝(다음 '## ' 제목 바로 앞)에 block을 넣는다. 장을 못 찾으면 넣지 않는다."""
+    match = section.search(body)
+    if not match:
+        logger.warning("[표 생성] %s를 넣을 장을 찾지 못해 넣지 않음", name)
+        return body
+    nxt = H2_PATTERN.search(body, match.end())
+    end = nxt.start() if nxt else len(body)
+    return body[:end].rstrip() + "\n\n" + block + "\n\n" + body[end:]
+
+
+def insert_timeline_table(body: str, state: dict, sources: list[dict]) -> str:
+    table = build_timeline_table(state, sources)
+    return _append_to_section(body, SECTION1_PATTERN, table, "개발 단계 타임라인") if table else body
+
+
+def insert_score_basis_tables(body: str, scores: dict, sources: list[dict]) -> str:
+    """점수표(insert_score_table가 넣은 것) 바로 아래에 넣는다. 점수표가 없으면 넣지 않는다."""
+    tables = build_score_basis_tables(scores, sources)
+    score_table = build_score_table(scores)
+    if not tables or score_table == TABLE_UNAVAILABLE or score_table not in body:
+        if tables:
+            logger.warning("[표 생성] 점수표를 찾지 못해 채점 근거 표를 넣지 않음")
+        return body
+    return body.replace(score_table, score_table + "\n\n" + tables, 1)
 
 
 # ═════════════════════════════════════════════════════════════
@@ -710,7 +823,9 @@ def assemble_report(state: dict, body: str, sources: list[dict]) -> str:
     body = HR_PATTERN.sub("", body)                          # '---' 구분선은 PDF에 글자로 찍히므로 지운다
     if _is_recommend_mode(state):
         body = insert_score_table(body, state["scores"])
+        body = insert_score_basis_tables(body, state["scores"], sources)
         body = insert_competitor_table(body, state)
+        body = insert_timeline_table(body, state, sources)
         body, sources = keep_cited_sources(body, sources)   # REFERENCE에는 본문에서 인용한 출처만
     else:  # 추천 없음 보고서: 점수표·경쟁사 표 대신 2장에 후보별 결과 표(코드가 State에서 만든다)
         body = body.replace(PLACEHOLDER, "").replace(COMPETITOR_PLACEHOLDER, "")
@@ -846,6 +961,9 @@ SCORE_TABLE_FRACS = (0.36, 0.26, 0.14, 0.24)   # 점수표(4칸) 열 폭 비율
 TABLE_FRACS = {                                # 표 첫 칸 제목 → 열 폭 비율 (없으면 균등)
     "항목": SCORE_TABLE_FRACS,
     "순서": (0.07, 0.17, 0.12, 0.12, 0.52),     # 후보 평가 과정 표: '사유' 칸을 넓게
+    TIMELINE_HEADER: (0.14, 0.72, 0.14),        # 개발 단계 타임라인: '내용' 칸을 넓게
+    RUBRIC_POSITION_HEADER: (0.17, 0.25, 0.29, 0.29),   # 점수 칸은 점수 막대가 들어가 점수표만큼 넓게
+    SCORE_BASIS_HEADER: (0.18, 0.68, 0.14),     # 항목별 판단 근거: '판단 근거' 칸을 넓게
 }
 
 # State 안의 company 키 후보 (팀원 State와 다르면 여기만 수정)

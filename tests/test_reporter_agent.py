@@ -3,10 +3,11 @@
 - 목차 1~4장 제목에 품질 평가의 4개 관점 이름이 들어가고, 바뀐 장 번호로 표가 들어간다
 - 품질 평가 미달로 다시 쓸 때 수정 지시가 프롬프트에 붙는다
 - 재작성 한도까지 미달이면 미달 항목이 한계점에 남는다
+- 코드가 State로 만드는 보조 표(개발 단계 타임라인, 채점 근거)가 제 장에 들어가고 인용·사실 검증과 어긋나지 않는다
 """
 from types import SimpleNamespace
 
-from agents import quality, reporter
+from agents import quality, reporter, verifier
 from config import MAX_QUALITY_LOOPS
 
 
@@ -193,7 +194,6 @@ def test_prompt_rules_for_rounded_amounts_and_marketing_words():
     assert "used_by에 competitor" in reporter.SYSTEM_PROMPT
 
 
-
 def test_competitor_agent_strips_result_numbers():
     from agents import competitor
     analysis = {"competitors": [{"name": "Hailo", "comparison": "TOPS 우위[2, 5]"}],
@@ -201,7 +201,6 @@ def test_competitor_agent_strips_result_numbers():
     out = competitor._strip_refs(analysis)
     assert out["competitors"][0]["comparison"] == "TOPS 우위"
     assert out["differentiation"] == ["특허 12건"] and out["competitive_risks"] == ["가격 경쟁"]
-
 
 
 def test_key_name_only_bullets_are_removed():
@@ -215,3 +214,131 @@ def test_summary_is_not_scaled_and_body_follows_dashboard_overflow(tmp_path, mon
     font, bold = reporter.register_korean_font()
     assert reporter._styles(font, bold, scaled=False)["body"].leading < reporter._styles(font, bold)["body"].leading
     assert reporter._LAYOUT_SCALE == 1.45
+
+
+# ---------- 코드 생성 보조 표 (개발 단계 타임라인, 채점 근거) ----------
+LEVELS = reporter.rubric_levels()
+URL_A, URL_B, URL_C = "https://a.com/1", "https://b.com/2", "https://c.com/3"
+TABLE_SOURCES = [{"n": 1, "label": "웹페이지", "title": "기사A", "text": "매체(2026). 기사A.", "raw": [{"url": URL_A, "node": "tech_summary"}]},
+                 {"n": 2, "label": "웹페이지", "title": "기사B", "text": "매체(2026). 기사B.", "raw": [{"url": URL_B, "node": "team"}]},
+                 {"n": 3, "label": "웹페이지", "title": "기사C", "text": "매체(2026). 기사C.", "raw": [{"url": URL_C, "node": "explorer"}]}]
+
+
+def item(score, url=URL_B, insufficient=False):
+    return {"score": score, "evidence": f"{score}점 근거.", "sources": [{"title": "t", "url": url}],
+            "insufficient": insufficient}
+
+
+SCORES = {"items": {"tech": item(5, URL_A), "market": item(3), "team": item(4), "traction": item(4),
+                    "competition": item(2, insufficient=True), "deal": item(4, URL_C)},
+          "total": 75.0, "decision": "투자"}
+TECH = {"evidence": [
+    {"field": "development_stage", "text": "양산 시작.", "date": "2026-08-26", "url": URL_B},
+    {"field": "development_stage", "text": "날짜 없는 주장.", "date": "", "url": URL_C},
+    {"field": "development_stage", "text": "시제품 제작.", "date": "2025-03-04", "url": URL_A},
+    {"field": "development_stage", "text": "시제품 제작.", "date": "2025-03-04", "url": URL_A},   # 같은 문장은 한 번
+    {"field": "strengths", "text": "강점은 타임라인에 넣지 않는다.", "date": "2024-01-01", "url": URL_A},
+]}
+
+
+def table_rows(text: str, header: str) -> list[list[str]]:
+    lines = text.splitlines()
+    start = next(i for i, l in enumerate(lines) if l.startswith(f"| {header} |"))
+    rows = []
+    for line in lines[start + 2:]:
+        if not line.startswith("|"):
+            break
+        rows.append([c.strip() for c in line.strip().strip("|").split("|")])
+    return rows
+
+
+def test_timeline_is_sorted_by_date_with_unknown_last_and_cited():
+    rows = table_rows(reporter.build_timeline_table({"tech_summary": TECH}, TABLE_SOURCES), reporter.TIMELINE_HEADER)
+    assert [r[0] for r in rows] == ["2025-03-04", "2026-08-26", reporter.UNKNOWN_DATE]
+    assert [r[1] for r in rows] == ["시제품 제작.", "양산 시작.", "날짜 없는 주장."]
+    assert [r[2] for r in rows] == ["[1]", "[2]", "[3]"]
+
+
+def test_timeline_is_skipped_without_development_stage_evidence():
+    assert reporter.build_timeline_table({"tech_summary": {"evidence": []}}, TABLE_SOURCES) is None
+    assert reporter.build_timeline_table({}, TABLE_SOURCES) is None
+    one = {"evidence": [{"field": "development_stage", "text": "한 건뿐.", "date": "2026-01-01", "url": URL_A}]}
+    assert reporter.build_timeline_table({"tech_summary": one}, TABLE_SOURCES) is None   # 1행은 비교가 안 된다
+    body = "## 1. 사업 아이디어·기술 성숙도\n본문.\n## 2. 시장성\n본문.\n"
+    assert reporter.insert_timeline_table(body, {}, TABLE_SOURCES) == body
+
+
+def test_score_basis_tables_follow_rubric_levels():
+    text = reporter.build_score_basis_tables(SCORES, TABLE_SOURCES)
+    position = {r[0]: r for r in table_rows(text, reporter.RUBRIC_POSITION_HEADER)}
+    assert list(position) == list(reporter.ITEM_LABELS.values())          # 점수표와 같은 순서·이름
+    tech, market = position["기술·제품 성숙도"], position["시장성"]
+    assert tech[1:] == ["5/5", LEVELS["tech"][4], "–"]                    # 5점이면 다음 조건 없음
+    assert market[1:] == ["3/5", LEVELS["market"][2], LEVELS["market"][3]]
+    basis = {r[0]: r for r in table_rows(text, reporter.SCORE_BASIS_HEADER)}
+    assert basis["경쟁 우위"][1].startswith(f"(정보 부족으로 최대 {reporter.INSUFFICIENT_MAX_SCORE}점)")
+    assert basis["기술·제품 성숙도"][2] == "[1]" and basis["투자조건"][2] == "[3]"
+
+
+def test_table_citations_are_spaced_and_capped():
+    many = [{"n": n, "raw": [{"url": f"https://x.com/{n}"}]} for n in range(1, 10)]
+    cell = reporter._citations_for_urls(many, [f"https://x.com/{n}" for n in range(1, 10)])
+    assert cell == " ".join(f"[{n}]" for n in range(1, reporter.MAX_TABLE_CITATIONS + 1))
+
+
+def test_score_basis_tables_skipped_without_items():
+    assert reporter.build_score_basis_tables({"items": {}}, TABLE_SOURCES) is None
+
+
+def test_new_table_headers_do_not_trigger_special_pdf_figures():
+    for header in (reporter.TIMELINE_HEADER, reporter.RUBRIC_POSITION_HEADER, reporter.SCORE_BASIS_HEADER):
+        assert header not in (reporter.LANDSCAPE_HEADER, reporter.STRENGTH_HEADER)
+        assert header in reporter.TABLE_FRACS
+
+
+BODY = ("## SUMMARY\n요약.\n## 1. 사업 아이디어·기술 성숙도\n기술 본문[2].\n### 소제목\n더 쓴 본문[2].\n"
+        "## 2. 시장성\n시장 본문.\n## 6. 투자 판단 결과\n{{SCORE_TABLE}}\n항목별 해설.\n## 7. 사업 리스크\n리스크.\n")
+
+
+def assembled():
+    state = {"company": {"name": "A사"}, "tech_summary": TECH, "scores": SCORES}
+    return reporter.assemble_report(state, BODY, [dict(s) for s in TABLE_SOURCES])
+
+
+def test_tables_land_in_their_chapters_and_citations_match_reference():
+    report = assembled()
+    chapters = dict(reporter._sections(report))
+    chapter1 = chapters["1. 사업 아이디어·기술 성숙도"]
+    assert f"| {reporter.TIMELINE_HEADER} |" in chapter1
+    assert chapter1.index("더 쓴 본문") < chapter1.index(reporter.TIMELINE_CAPTION)   # 장 끝(소제목 뒤)
+    chapter6 = chapters["6. 투자 판단 결과"]
+    assert chapter6.index("환산 점수") < chapter6.index(reporter.RUBRIC_POSITION_CAPTION) < chapter6.index("항목별 해설")
+    # 본문에서 처음 인용한 [2]가 1번이 되도록 다시 매기고, 표의 번호도 같이 바뀐다
+    assert reporter.printed_reference_numbers(report) == {1, 2, 3}
+    assert not verifier.check_citations(report)
+    assert reporter.check_format(report) == []
+
+
+def test_rubric_wording_in_tables_is_not_flagged_by_verifier():
+    state = {"company": {"name": "A사"}, "tech_summary": TECH, "scores": SCORES, "sources": []}
+    report = assembled()
+    mismatches, _ = verifier.find_quantity_mismatches(report, verifier.build_evidence(state))
+    assert not mismatches, mismatches     # 기준표의 '10~20%', '30억 원' 등도 정답지에 있다
+    # 기준표 문구라도 본문 문장에 쓰면 그대로 잡는다 (표 줄만 예외)
+    assert not verifier.find_wording_problems("| 시장성 | 수십억 달러 이상 규모 |\n", state)
+    assert verifier.find_wording_problems("시장은 수십억 달러 이상 규모다.\n", state)
+
+
+def test_tables_do_not_worsen_quality_groundedness(monkeypatch):
+    with_tables = assembled()
+    monkeypatch.setattr(reporter, "build_timeline_table", lambda *a: None)
+    monkeypatch.setattr(reporter, "build_score_basis_tables", lambda *a: None)
+    without = assembled()
+    assert with_tables != without
+    assert quality.check_groundedness(with_tables, True) == quality.check_groundedness(without, True)
+
+
+def test_dates_are_not_checked_as_quantities():
+    evidence = {"pairs": set(), "values": set(), "points": set()}
+    mismatches, _ = verifier.find_quantity_mismatches("| 2026-08-26 | 양산 시작 |\n(2025-03-04 기준) 매출 50억 원\n", evidence)
+    assert [m["surface"] for m in mismatches] == ["50억 원"]   # 날짜의 '26'·'04'는 빼고 진짜 수량만 검사한다
