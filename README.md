@@ -172,13 +172,13 @@ supervisor 바로 다음에 이어진 분석 노드들(tech_summary·market·com
 
 | 캡처 | supervisor 단계 | 보여 주는 동적 처리 |
 |---|---|---|
-| [tracing-1.png](assets/tracing-1.png) | 1~5 | 후보 발굴 → iHW 4관점 병렬 → team만 재작업 → judge → 보류 후 다음 후보 탐색 |
-| [tracing-2.png](assets/tracing-2.png) | 6~9 | 엑시나 4관점 병렬 → tech_summary·team 재작업 → judge(70점, 투자) → reporter |
-| [tracing-3.png](assets/tracing-3.png) | 10~16 | 사실 검증 불일치 → 재작성 → 품질 평가 미달(근거 부족) → tech_summary·team·market 재조사 → judge 재판단(74점) → 보고서 다시 작성 |
-| [tracing-4.png](assets/tracing-4.png) | 17~22 | 품질 미달 → 재작성 2/2 → 재검증·재평가 → 한도 도달 종료 |
-| [tracing-5.png](assets/tracing-5.png) | 3 | supervisor 결정 사유: "team: 창업자·핵심 인력 공개 정보 부족 … → 재작업 1/1" (`last_decision`, `rework_request`) |
-| [tracing-6.png](assets/tracing-6.png) | 5 | supervisor 결정 사유: "iHW 보류(68.0점) → 다음 후보 엑시나" |
-| [tracing-7.png](assets/tracing-7.png) | 14 | supervisor 결정 사유: "품질 평가 근거 부족 → 관점 재조사 1/1" |
+| [tracing-1.png](docs/tracing-1.png) | 1~6 | 후보 발굴 → iHW 4관점 병렬 → team만 재작업 → judge → 보류 후 다음 후보 탐색 → 엑시나 4관점 시작 |
+| [tracing-2.png](docs/tracing-2.png) | 6~12 | 엑시나 4관점 → team·tech_summary 재작업 → judge(70점, 투자) → reporter → 사실 검증 불일치 → 재작성 → 재검증 |
+| [tracing-3.png](docs/tracing-3.png) | 13~20 | 품질 평가 미달(근거 부족) → market·team·tech_summary 재조사 → judge 재판단(74점) → 보고서 다시 작성 → 검증 → 품질 미달 → 재작성 2/2 |
+| [tracing-4.png](docs/tracing-4.png) | 20~22 | 재검증 → 품질 평가 → 한도 도달 종료 |
+| [tracing-5.png](docs/tracing-5.png) | 3 | supervisor 결정: `last_decision` "[3] team ← 창업자·핵심 인력 공개 정보 부족, 웹 근거가 모두 같은 날 보도 → 재작업", `evidence_status`(관점별 충분 여부·사유·보완 대상) |
+| [tracing-6.png](docs/tracing-6.png) | 5 | supervisor 결정: "[5] explorer ← iHW 보류(68.0점) → 다음 후보 엑시나", `current_index` 1로 이동 |
+| [tracing-7.png](docs/tracing-7.png) | 14 | supervisor 결정: "[14] tech_summary, team, market ← 품질 평가 근거 부족 → 관점 재조사", `reopen_stage` research, `rework_request`(관점별 사유·보완 대상) |
 
 같은 실행의 결정과 사유 전체는 `outputs/decisions/{trace_id}.jsonl`에 있다.
 
@@ -258,9 +258,8 @@ supervisor 바로 다음에 이어진 분석 노드들(tech_summary·market·com
 │   ├── embedding/    # 임베딩 후보 비교 실험
 │   └── market/       # 시장성 평가 정답지, 평가 스크립트, 결과
 ├── tests/            # 단위 테스트 (API 키 없이 실행)
-├── assets/           # README 그림 (LangSmith 캡처 tracing-*.png)
 ├── fonts/            # PDF 한글 글꼴 (Pretendard, SIL OFL)
-├── docs/             # 역할 분담
+├── docs/             # 역할 분담, LangSmith 캡처(tracing-*.png)
 ├── prompts/          # (비어 있음) 프롬프트는 agents/ 각 파일에 있다
 ├── outputs/          # 실행 결과: 보고서(md·PDF), 결정 로그, 체크포인트, 채점 로그 (git 제외)
 ├── state.py          # 공용 State 정의 (제어/페이로드, reducer)
