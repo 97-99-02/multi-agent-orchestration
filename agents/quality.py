@@ -27,7 +27,7 @@ from pydantic import BaseModel, Field
 
 from agents.reporter import REFERENCE_HEADING, printed_reference_numbers
 from agents.verifier import _evidence_json, check_citations, find_wording_problems
-from config import (LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MODEL_JUDGE, QUALITY_CITED_RATIO,
+from config import (LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MAX_QUALITY_LOOPS, MODEL_JUDGE, QUALITY_CITED_RATIO,
                     QUALITY_MAX_SOURCE_SHARE, QUALITY_MAX_UNVERIFIED, QUALITY_MIN_PUBLISHERS,
                     QUALITY_MIN_SECTION_CHARS)
 
@@ -49,6 +49,7 @@ DISPARAGING = ("열등", "상대가 되지", "뒤처진 기업", "경쟁력이 �
 CITATION = re.compile(r"\[(\d+)\]")
 REFERENCE_LINE = re.compile(r"^- \[(\d+)\] ([^(\n]+?)\(", re.MULTILINE)
 UNVERIFIED_MARK = "(확인 필요)"
+NOTE_HEADING = "### 품질 평가 미달 항목"
 
 
 # ---------- 보고서 읽기 ----------
@@ -230,6 +231,19 @@ def llm_checks(report: str, state: dict, judge_llm) -> QualityJudgement:
 
 
 # ---------- 노드 ----------
+def add_quality_note(report: str, items: dict) -> str:
+    """재작성 한도까지 미달이면 미달 항목을 한계점 장 끝(REFERENCE 앞)에 남긴다. 이미 있으면 다시 넣지 않는다."""
+    if NOTE_HEADING in report:
+        return report
+    lines = [f"- {ITEM_LABELS[k]}: {'; '.join(items[k]['reasons'][:2])}" for k in ITEMS if not items[k]["passed"]]
+    note = (f"{NOTE_HEADING}\n보고서를 {MAX_QUALITY_LOOPS}회 다시 썼으나 아래 항목이 품질 기준에 미달했다.\n"
+            + "\n".join(lines))
+    head, sep, tail = report.partition(REFERENCE_HEADING)
+    if not sep:
+        return report.rstrip() + "\n\n" + note + "\n"
+    return head.rstrip() + "\n\n" + note + "\n\n" + sep + tail
+
+
 def fix_instructions(items: dict) -> str:
     lines = [f"- [{ITEM_LABELS[k]}] {r}" for k in ITEMS for r in items[k]["reasons"] if not items[k]["passed"]]
     return "\n".join(lines)
@@ -255,9 +269,13 @@ def quality_eval_node(state: dict, judge_llm=None) -> dict:
     passed = all(v["passed"] for v in items.values())
     logger.info("[품질 평가] v%s %s: %s", state.get("report_version"), "통과" if passed else "미달",
                 {k: v["passed"] for k, v in items.items()})
-    return {"eval_result": {
+    out = {"eval_result": {
         "passed": passed, "report_version": state.get("report_version"),
         "mode": "recommend" if is_recommend(state) else "no_recommend",
         "items": items, "fix_instructions": fix_instructions(items),
         "judge_ran": judgement is not None, "judge_error": judge_error,
     }}
+    # 재작성 한도에 도달한 미달이면 supervisor가 종료하므로, 미달 항목을 보고서 한계점에 남긴다 (verifier의 '확인 필요'와 같은 방식)
+    if not passed and state.get("quality_loops", 0) >= MAX_QUALITY_LOOPS:
+        out["report"] = add_quality_note(report, items)
+    return out

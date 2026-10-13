@@ -70,7 +70,7 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
    - 추가 확인이 필요한 사항 (1~2개). [분석 자료]에 summary_caution이 있으면 그 내용(항목명과 점수)을
      한 항목으로 반드시 포함합니다. (예: 기술·제품 성숙도 2점(정보 부족으로 제한) 확인 필요)
 6. 'REFERENCE' 장은 쓰지 않습니다. (코드가 실제 사용 출처로 자동 첨부합니다.)
-7. 본문 전체는 5장(페이지) 이내 분량, 한글 기준 약 8,000자 이내로 간결하게 씁니다.
+7. 본문 전체는 8장(페이지) 이내 분량, 한글 기준 약 12,000자 이내로 간결하게 씁니다. (PDF는 대시보드·REFERENCE 포함 10장 이내)
 8. '투자 판단 결과' 장에는 점수표를 직접 쓰지 말고, 표가 들어갈 자리에 {{SCORE_TABLE}} 한 줄만 쓰세요.
    그 아래에 항목별 근거를 문장으로 해설합니다. (표는 코드가 자동으로 채웁니다.)
 9. 수치나 사실을 말하는 문장 끝에는 [분석 자료]의 sources_for_citation에 있는 번호를 [1]처럼 붙이세요.
@@ -92,17 +92,25 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
     기업 사실은 웹 출처를, 업계 해석은 연결된 기업 웹 출처와 보고서 출처를 함께 인용합니다.
     conditions_missing은 비교 조건이 부족하다는 뜻이므로 기술 우위·업계 순위로 표현하지 않습니다.
     업계 보고서의 수치를 기업의 양산·매출·계약 실적으로 바꾸지 않습니다.
+17. 1~4장은 평가 관점별 장입니다. 장 제목의 관점 이름(기술 성숙도, 시장성, 이해관계자, 도메인 적용)을 그대로 씁니다.
+    '이해관계자' 장은 창업자·핵심 인력(team_analysis)과 투자사·투자 조건(company의 investors, 투자 금액·기업가치)을,
+    '도메인 적용' 장은 고객·PoC·공급 계약 등 실적(tech_summary의 public_revenue_contracts)과 적용 분야(세부 분야)를 다룹니다.
+    자료가 없으면 그 장에 '정보 부족'이라고 명시하고 없는 내용을 채우지 않습니다.
+18. '사업 리스크' 장의 리스크마다 근거 출처 번호를 붙입니다. (market_risks, competitive_risks, 기술 약점 등 자료에 있는 리스크)
+    유리한 근거만 고르지 말고, 자료에 있는 약점·리스크·반대 근거도 해당 장에 씁니다.
+19. [분석 자료]에 halted가 있으면 평가가 중간에 멈춘 것이므로 '한계점' 장 첫 문장에 그 사유를 그대로 씁니다.
 """
 
 # 투자 추천 기업이 있을 때의 목차
 TOC_RECOMMEND = """## SUMMARY (위 5번 틀 그대로)
-## 1. 사업 아이디어 (핵심 컨셉)
-## 2. 시장 규모
-## 3. 팀의 구성
-## 4. 경쟁 구도 (자리 {{COMPETITOR_TABLE}} + 경쟁 구도가 투자 판단에 주는 의미 2~3문장)
-## 5. 투자 판단 결과 (점수표 자리 {{SCORE_TABLE}} + 항목별 근거 해설)
-## 6. 사업 리스크 (시장·기술·규제·경쟁)
-## 7. 한계점 ('정보 부족' 항목, '확인 필요' 수치, 보류·제외 기업과 사유)"""
+## 1. 사업 아이디어·기술 성숙도 (핵심 칩, 공정, 개발 단계, 성능)
+## 2. 시장성 (세부 분야 시장 규모·성장률, 수요 요인)
+## 3. 이해관계자 (창업자·핵심 인력, 투자사·투자 조건)
+## 4. 도메인 적용 (고객·PoC·공급 계약 등 실적, 적용 분야)
+## 5. 경쟁 구도 (자리 {{COMPETITOR_TABLE}} + 경쟁 구도가 투자 판단에 주는 의미 2~3문장)
+## 6. 투자 판단 결과 (점수표 자리 {{SCORE_TABLE}} + 항목별 근거 해설)
+## 7. 사업 리스크 (시장·기술·규제·경쟁, 리스크마다 출처 번호)
+## 8. 한계점 ('정보 부족' 항목, '확인 필요' 수치, 보류·제외 기업과 사유)"""
 
 # 모든 후보가 보류/제외되었을 때의 목차
 TOC_NO_RECOMMEND = """## SUMMARY
@@ -122,6 +130,12 @@ USER_TEMPLATE = """[보고서 유형] {mode}
 
 {fix_notes}
 위 자료만 근거로 보고서를 작성하세요."""
+
+# 품질 평가가 미달로 되돌려 보냈을 때 붙는 추가 지시 (agents/quality.py의 fix_instructions)
+QUALITY_FIX_TEMPLATE = """[품질 수정 요청] 직전 보고서가 품질 평가에서 아래 항목이 미달이었습니다.
+사실을 새로 만들지 말고 [분석 자료] 안에서 고치세요. 근거가 없으면 '정보 부족'으로 쓰세요.
+{items}
+"""
 
 # 사실 검증에서 불일치가 나와 '재작성'할 때만 붙는 추가 지시
 FIX_NOTES_TEMPLATE = """[수정 요청] 직전 보고서에서 아래 항목이 [분석 자료]와 일치하지 않았습니다.
@@ -169,7 +183,7 @@ ANALYSIS_KEYS = (
 # 과제 조건 점검
 SUMMARY_MAX_CHARS = 900     # A4 반 페이지 ≈ 한글 900자 (대략치. 조에서 조정 가능)
 PAGE_CHARS = 1800           # A4 한 페이지 ≈ 한글 1,800자 (대략치)
-MAX_PAGES = 5               # 과제 조건: 5장 이내
+MAX_PAGES = 10              # 과제 조건: 최대 10장 (Agent 과제)
 SUMMARY_BULLETS = 3         # SUMMARY 틀: 핵심 근거·핵심 리스크 각 3개
 CONFIRM_BULLETS = (1, 2)    # SUMMARY 틀: 확인 필요 1~2개
 SUMMARY_LABELS = ("**결론:**", "**핵심 근거**", "**핵심 리스크**", "**확인 필요**")
@@ -188,11 +202,11 @@ UNKNOWN_DATE = "날짜 미상"
 REFERENCE_HEADING = "## REFERENCE"
 
 PLACEHOLDER = "{{SCORE_TABLE}}"                      # AI가 쓰는 '표 자리' 표시
-COMPETITOR_PLACEHOLDER = "{{COMPETITOR_TABLE}}"      # 4장 경쟁사 표 자리
+COMPETITOR_PLACEHOLDER = "{{COMPETITOR_TABLE}}"      # 5장 경쟁사 표 자리
 CANDIDATE_PLACEHOLDER = "{{CANDIDATE_TABLE}}"        # '추천 기업 없음' 보고서 2장 후보 표 자리
 SECTION2_PATTERN = re.compile(r"^##\s*2\.[^\n]*\n", re.MULTILINE)
-SECTION4_PATTERN = re.compile(r"^##\s*4\.[^\n]*\n", re.MULTILINE)
-SECTION5_PATTERN = re.compile(r"^##\s*5\.[^\n]*\n", re.MULTILINE)
+COMPETITOR_SECTION_PATTERN = re.compile(r"^##\s*5\.[^\n]*\n", re.MULTILINE)   # 5장 경쟁 구도
+SCORE_SECTION_PATTERN = re.compile(r"^##\s*6\.[^\n]*\n", re.MULTILINE)        # 6장 투자 판단 결과
 HR_PATTERN = re.compile(r"^[ \t]*(?:[-*_][ \t]*){3,}$\n?", re.MULTILINE)  # AI가 넣는 '---' 구분선
 LEADING_TIER = "선도 기업"                            # 경쟁 구도에서 왼쪽(진입 위협)에 놓을 구분
 PEER_TIER = "동급 기업"                               # 오른쪽(직접 경쟁)에 놓을 구분
@@ -313,7 +327,7 @@ def _cell(text) -> str:
 
 
 def build_competitor_table(state: dict) -> str:
-    """4장 경쟁 구도: ① 구도 표(평가 대상·선도 기업·동급 기업) ② 차별점·경쟁 리스크 표. 값은 competitor_analysis 그대로.
+    """5장 경쟁 구도: ① 구도 표(평가 대상·선도 기업·동급 기업) ② 차별점·경쟁 리스크 표. 값은 competitor_analysis 그대로.
 
     마크다운에서는 표로 읽히고, PDF에서는 첫 칸 제목('구분'/'차별점')을 보고 구도 그림과 2칸 패널로 그린다.
     """
@@ -358,13 +372,13 @@ def build_candidate_table(state: dict) -> str | None:
 
 
 def insert_score_table(body: str, scores: dict) -> str:
-    """본문의 자리표시자를 점수표로 바꾼다. 자리표시자가 없으면 5장 제목 아래에 넣는다."""
+    """본문의 자리표시자를 점수표로 바꾼다. 자리표시자가 없으면 6장 제목 아래에 넣는다."""
     table = build_score_table(scores)
     if PLACEHOLDER in body:
         return body.replace(PLACEHOLDER, table)
-    match = SECTION5_PATTERN.search(body)
+    match = SCORE_SECTION_PATTERN.search(body)
     if match:
-        logger.warning("[표 생성] 자리표시자가 없어 5장 제목 아래에 표를 삽입")
+        logger.warning("[표 생성] 자리표시자가 없어 6장 제목 아래에 표를 삽입")
         return body[: match.end()] + "\n" + table + "\n" + body[match.end():]
     logger.warning("[표 생성] 삽입 위치를 찾지 못해 본문 끝에 표를 추가")
     return body + "\n\n" + table
@@ -383,8 +397,8 @@ def _insert_table(body: str, placeholder: str, table: str, section: re.Pattern, 
 
 
 def insert_competitor_table(body: str, state: dict) -> str:
-    """4장의 자리표시자를 경쟁사 표로 바꾼다. 자리표시자가 없으면 4장 제목 아래에 넣는다."""
-    return _insert_table(body, COMPETITOR_PLACEHOLDER, build_competitor_table(state), SECTION4_PATTERN, "경쟁사 표")
+    """5장의 자리표시자를 경쟁사 표로 바꾼다. 자리표시자가 없으면 5장 제목 아래에 넣는다."""
+    return _insert_table(body, COMPETITOR_PLACEHOLDER, build_competitor_table(state), COMPETITOR_SECTION_PATTERN, "경쟁사 표")
 
 
 # ═════════════════════════════════════════════════════════════
@@ -532,7 +546,7 @@ def check_format(report: str, structured_summary: bool = False,
                  summary_names: list[str] | tuple = (), summary_cautions: list[str] | tuple = ()) -> list[str]:
     """과제 조건 위반 목록을 돌려준다. 비어 있으면 모두 통과.
 
-    점검: SUMMARY 맨 앞·길이, REFERENCE 맨 뒤, 전체 5장 이내(글자 수 근사),
+    점검: SUMMARY 맨 앞·길이, REFERENCE 맨 뒤, 전체 MAX_PAGES장 이내(글자 수 근사),
     structured_summary=True면 SUMMARY 고정 틀까지, summary_names가 있으면 SUMMARY에 그 이름(후보)이 모두 있는지,
     summary_cautions가 있으면 SUMMARY '확인 필요'에 그 항목 이름이 있는지.
     (실제 페이지 수는 PDF 저장 때 다시 센다)
@@ -601,7 +615,7 @@ def build_materials(state: dict, sources: list[dict]) -> dict:
         materials["sources_for_citation"] = [
             {"n": s["n"], "type": s["label"], "title": s["title"]} for s in sources
         ]
-        # SUMMARY 결론에 '후보 A, B, C 중 선정'을 쓰게 하려는 것. (평가 순서·사유 표는 코드가 5장에 넣는다)
+        # SUMMARY 결론에 '후보 A, B, C 중 선정'을 쓰게 하려는 것. (평가 순서·사유 표는 코드가 6장에 넣는다)
         materials["selection"] = {"candidates": state.get("candidates") or [],
                                   "selected": state["company"].get(COMPANY_NAME_KEY)}
         hint = caution_summary_hint(state["scores"])
@@ -611,6 +625,8 @@ def build_materials(state: dict, sources: list[dict]) -> dict:
         materials = {"candidates": state.get("candidates") or []}
     materials["rejected"] = state.get("rejected", [])  # 보류·제외 기업과 사유는 한계점에 항상 쓰인다
     materials["evaluation_rules"] = evaluation_rules()  # AI가 기준을 추측해 틀리게 쓰지 않도록
+    if state.get("last_error"):   # supervisor 단계 한도 등으로 평가가 중간에 멈춘 경우 (규칙 19)
+        materials["halted"] = state["last_error"]
     return materials
 
 
@@ -665,6 +681,15 @@ def _verify_fix_notes(state: dict) -> str:
     return FIX_NOTES_TEMPLATE.format(items=items)
 
 
+def _quality_fix_notes(state: dict) -> str:
+    """직전 보고서(report_version - 1)가 품질 평가에서 미달이었다면 수정 지시를 프롬프트에 붙인다."""
+    result = state.get("eval_result") or {}
+    previous = (state.get("report_version") or 0) - 1
+    if result.get("passed", True) or result.get("report_version") != previous or not result.get("fix_instructions"):
+        return ""
+    return QUALITY_FIX_TEMPLATE.format(items=result["fix_instructions"])
+
+
 def reporter_node(state: dict, llm=None) -> dict:
     """보고서 생성 노드. State를 받아 '바꿀 키만' dict로 돌려준다.
 
@@ -687,7 +712,7 @@ def reporter_node(state: dict, llm=None) -> dict:
     materials = json.dumps(build_materials(state, sources), ensure_ascii=False, indent=2)
     llm = llm or _get_llm()
 
-    verify_notes, format_notes, report = _verify_fix_notes(state), "", ""
+    verify_notes, format_notes, report = _verify_fix_notes(state) + _quality_fix_notes(state), "", ""
     for attempt in range(MAX_FORMAT_FIXES + 1):
         user_prompt = USER_TEMPLATE.format(
             mode=mode, toc=TOC_RECOMMEND if recommend else TOC_NO_RECOMMEND,
@@ -768,11 +793,11 @@ NOTE_TITLE = "자동 검증 결과"
 # ── 파일명 ───────────────────────────────────────────────────
 def build_output_filename(campus: str = CAMPUS, class_no: str = CLASS_NO,
                           members: list[str] | None = None) -> str:
-    """과제 파일명 규칙: RAG-Output_{캠퍼스}-{X반}_{이름1+이름2+...}.pdf"""
+    """보고서 PDF 파일명: Agent-Output_{캠퍼스}-{X반}_{이름1+이름2+...}.pdf (제출 zip은 Agent_{캠퍼스}_{X반}_{이름...}.zip)"""
     members = members or MEMBERS
     if not members:
         raise ValueError("조원 이름 목록이 비어 있습니다.")
-    return f"RAG-Output_{campus}-{class_no}_{'+'.join(members)}.pdf"
+    return f"Agent-Output_{campus}-{class_no}_{'+'.join(members)}.pdf"
 
 
 # ── 글꼴 ─────────────────────────────────────────────────────
