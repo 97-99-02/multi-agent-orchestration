@@ -559,3 +559,8 @@ def test_dates_are_not_checked_as_quantities():
     evidence = {"pairs": set(), "values": set(), "points": set()}
     mismatches, _ = verifier.find_quantity_mismatches("| 2026-08-26 | 양산 시작 |\n(2025-03-04 기준) 매출 50억 원\n", evidence)
     assert [m["surface"] for m in mismatches] == ["50억 원"]   # 날짜의 '26'·'04'는 빼고 진짜 수량만 검사한다
+
+
+
+def test_prompt_forbids_bracket_unit_conversion_and_present_tense_forecast():
+    assert "괄호로 덧붙이지 않습니다" in reporter.SYSTEM_PROMPT and "forecast=true 수치는" in reporter.SYSTEM_PROMPT

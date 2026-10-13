@@ -27,3 +27,122 @@ def test_url_date():
     assert date_from_url("https://wowtale.net/2026/05/30/259381") == "2026-05-30"
     assert date_from_url("https://www.etnews.com/20260601000245") == "2026-06-01"
     assert date_from_url("https://www.mk.co.kr/news/business/12064949") == ""
+
+
+# ---------- 2차 출처 → 원본 확인 (네트워크는 가짜 페이지로 대신한다) ----------
+import pytest  # noqa: E402
+
+from agents import web  # noqa: E402
+
+BLOG = "https://someone.tistory.com/546"
+PORTAL = "https://news.nate.com/view/20260525n02042"
+ORIGINAL = "https://www.news1.kr/industry/6173053"
+CLAIM = "엑시나는 2000억 원 규모 시리즈 B를 마무리했고 기업가치는 8500억 원이다."
+
+
+@pytest.fixture
+def pages(monkeypatch):
+    """url → HTML 가짜 페이지. find_original·fetch_page 캐시는 테스트마다 비운다."""
+    site = {}
+    monkeypatch.setattr(web, "fetch_page", lambda url: (url, site.get(url, "")))
+    monkeypatch.setattr(web, "_tavily", lambda *a, **k: [])
+    web.find_original.cache_clear()
+    yield site
+    web.find_original.cache_clear()
+
+
+def test_secondary_and_portal_hosts():
+    assert web.is_secondary("https://demoday.tistory.com/1") and web.is_secondary("https://m.blog.naver.com/x/1")
+    assert web.is_portal("https://v.daum.net/v/abc") and web.is_portal(PORTAL)
+    assert not web.is_secondary(ORIGINAL) and not web.is_portal(ORIGINAL)
+
+
+def test_original_links_follow_only_source_links():
+    html = (f'<a href="{ORIGINAL}">원문</a> <a href="https://www.news1.kr/other/1">다른 기사 제목</a>'
+            '<a href="https://twitter.com/news1">원문</a> 출처: <a href="https://www.etnews.com/2026">전자신문</a>')
+    assert web.original_links(PORTAL, html) == [ORIGINAL, "https://www.etnews.com/2026"]
+
+
+def test_confirms_needs_matching_facts():
+    assert web.confirms(CLAIM, "엑시나가 약 2,000억 원 시리즈 B 투자를 유치했다. 기업가치 8500억 원으로 평가됐다.")
+    assert not web.confirms(CLAIM, "엑시나가 1500억 원 투자를 추진한다. 기업가치는 8000억 원 수준.")
+
+
+def test_blog_is_replaced_by_confirmed_original(pages):
+    pages[BLOG] = f'<p>{CLAIM}</p> 출처: <a href="{ORIGINAL}">뉴스1</a>'
+    pages[ORIGINAL] = ('<meta property="og:title" content="엑시나 2000억 시리즈 B"><p>메뉴</p>'
+                       '<p>엑시나는 2000억 원 규모 시리즈 B 투자를 마무리했다. 기업가치는 8500억 원이다.</p>')
+    out = web.resolve_secondary([{"url": BLOG, "title": "블로그 분석", "content": CLAIM}])
+    assert len(out) == 1 and out[0]["url"] == ORIGINAL and out[0]["via"] == BLOG
+    assert out[0]["title"] == "엑시나 2000억 시리즈 B" and "8500억 원" in out[0]["content"]
+
+
+def test_blog_without_confirmed_original_is_dropped(pages):
+    pages[BLOG] = f'<p>{CLAIM}</p> 출처: <a href="{ORIGINAL}">뉴스1</a>'
+    pages[ORIGINAL] = "<p>엑시나는 1500억 원 투자를 추진 중이다.</p>"     # 원본 내용이 다르다
+    assert web.resolve_secondary([{"url": BLOG, "title": "블로그", "content": CLAIM}]) == []
+
+
+def test_portal_kept_when_original_not_found_and_normal_results_untouched(pages):
+    plain = {"url": ORIGINAL, "title": "기사", "content": CLAIM}
+    portal = {"url": PORTAL, "title": "기사 - 뉴스1", "content": CLAIM}
+    assert web.resolve_secondary([plain, portal]) == [plain, portal]
+
+
+def test_sns_posts_are_secondary(pages):
+    post = "https://www.instagram.com/p/DdDUVfWnxBl"
+    assert web.is_secondary(post) and web.is_secondary("https://www.linkedin.com/posts/abc")
+    assert not web.is_secondary("https://dx.com/a")                 # 'x.com'으로 끝나는 다른 도메인은 아니다
+    pages[post] = f"<p>{CLAIM}</p>"                                  # 원본 링크가 없는 게시물은 뺀다
+    assert web.resolve_secondary([{"url": post, "title": "[공시분석]", "content": CLAIM}]) == []
+
+
+# ---------- Tavily 요청 한도(429) ----------
+class FakeTavily:
+    """invoke마다 미리 정한 응답을 차례로 돌려준다."""
+    replies: list = []
+    calls = 0
+
+    def __init__(self, **kwargs):
+        pass
+
+    def invoke(self, _):
+        FakeTavily.calls += 1
+        return FakeTavily.replies.pop(0)
+
+
+LIMIT = {"error": "Error 429: Your request has been blocked due to excessive requests."}
+
+
+def test_tavily_retries_on_rate_limit_then_succeeds(monkeypatch):
+    waits = []
+    monkeypatch.setattr(web, "TavilySearch", FakeTavily)
+    monkeypatch.setattr(web.time, "sleep", waits.append)
+    FakeTavily.replies, FakeTavily.calls = [LIMIT, LIMIT, {"results": [{"url": "u"}]}], 0
+    assert web._tavily("q") == [{"url": "u"}]
+    assert waits == list(web.TAVILY_RETRY_WAITS[:2]) and FakeTavily.calls == 3
+
+
+def test_tavily_gives_up_after_retries_and_does_not_retry_other_errors(monkeypatch):
+    monkeypatch.setattr(web, "TavilySearch", FakeTavily)
+    monkeypatch.setattr(web.time, "sleep", lambda s: None)
+    FakeTavily.replies = [LIMIT] * (len(web.TAVILY_RETRY_WAITS) + 1)
+    with pytest.raises(RuntimeError, match="429"):
+        web._tavily("q")
+    FakeTavily.replies, FakeTavily.calls = [{"error": "Error 432: usage limit"}], 0
+    with pytest.raises(RuntimeError, match="432"):
+        web._tavily("q")
+    assert FakeTavily.calls == 1                                   # 사용량 초과는 기다려도 풀리지 않는다
+    FakeTavily.replies, FakeTavily.calls = [LIMIT], 0
+    with pytest.raises(RuntimeError):
+        web._tavily("q", retry=False)                              # 보조 검색은 기다리지 않는다
+    assert FakeTavily.calls == 1
+
+
+def test_title_search_has_a_per_run_limit(monkeypatch):
+    calls = []
+    monkeypatch.setattr(web, "_tavily", lambda *a, **k: calls.append(k.get("retry")) or [])
+    monkeypatch.setattr(web, "_title_searches", 0)
+    for i in range(web.TITLE_SEARCH_LIMIT + 3):
+        web._original_by_title(f"충분히 긴 기사 제목 {i} - 언론사")
+    assert len(calls) == web.TITLE_SEARCH_LIMIT and set(calls) == {False}

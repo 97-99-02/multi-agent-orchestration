@@ -25,7 +25,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from agents.reporter import REFERENCE_HEADING, cited_source_map, printed_reference_numbers
+from agents.reporter import REFERENCE_HEADING, cited_source_map, printed_reference_numbers, translate_field_names
 from agents.supervisor import evidence_report
 from agents.verifier import _evidence_json, check_citations, find_wording_problems
 from config import (LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MAX_QUALITY_LOOPS, MODEL_JUDGE, QUALITY_CITED_RATIO,
@@ -368,7 +368,9 @@ def add_quality_note(report: str, items: dict) -> str:
     """재작성 한도까지 미달이면 미달 항목을 한계점 장 끝(REFERENCE 앞)에 남긴다. 이미 있으면 다시 넣지 않는다."""
     if NOTE_HEADING in report:
         return report
-    lines = [f"- {ITEM_LABELS[k]}: {'; '.join(items[k]['reasons'][:2])}" for k in ITEMS if not items[k]["passed"]]
+    # Judge 사유는 자료를 영문 키 그대로 인용하기도 해('tech_summary.weaknesses') 보고서에 옮길 때 한글로 바꾼다
+    lines = [f"- {ITEM_LABELS[k]}: {translate_field_names('; '.join(items[k]['reasons'][:2]))}"
+             for k in ITEMS if not items[k]["passed"]]
     note = (f"{NOTE_HEADING}\n보고서를 {MAX_QUALITY_LOOPS}회 다시 썼으나 아래 항목이 품질 기준에 미달했다.\n"
             + "\n".join(lines))
     head, sep, tail = report.partition(REFERENCE_HEADING)

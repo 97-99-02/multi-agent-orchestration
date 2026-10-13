@@ -41,6 +41,7 @@ from agents.reporter import (
     WEIGHTS,
     _is_recommend_mode,
     cited_source_map,
+    score_claim_mismatches,
     find_insufficient_items,
     item_contributions,
     printed_reference_numbers,
@@ -233,7 +234,9 @@ def build_evidence(state: dict) -> dict:
         values : {값}          — 단위를 생략한 수는 값만 맞으면 통과
         points : {값}          — '~점'으로 쓴 수(점수)는 평가표 값과 대조
     """
-    quantities = parse_quantities(_evidence_json(state))
+    # judge의 채점 근거·리스크 문장은 LLM이 쓴 글이라 정답지에서 뺀다. 넣어 두면 judge가 잘못 환산한 값
+    # ('3,400백만달러(3.4억 달러)')을 보고서가 옮겨도 '자료에 있음'으로 통과했다. 점수 값은 아래 points로 따로 넣는다
+    quantities = parse_quantities(_evidence_json({**state, "scores": None}))
     # 출처의 근거 원문(snippet)도 정답지다 (state.Source: 사실 검증에 사용). 투자 기업의 출처만 쓴다
     name = (state.get("company") or {}).get("name")
     snippets = " ".join(str(src.get("snippet", "")) for src in state.get("sources", [])
@@ -702,6 +705,12 @@ def rag_check(report: str, state: dict, retriever, judge_llm) -> tuple[list[dict
 # ═════════════════════════════════════════════════════════════
 # 끝내 안 맞을 때의 처리
 # ═════════════════════════════════════════════════════════════
+def _in_rubric_cell(text: str, pos: int, surface: str) -> bool:
+    """pos가 기준표 문구를 옮긴 표 줄('|'로 시작) 안이고 표현이 기준표에 있는가 (find_wording_problems의 예외와 같은 기준)."""
+    line = text[text.rfind("\n", 0, pos) + 1:]
+    return line.startswith("|") and surface in RUBRIC
+
+
 def mark_unverified(report: str, mismatches: list[dict]) -> str:
     """끝내 안 맞는 표현 옆에 '(확인 필요)'를 붙인다. (설계 문서: 재작성 후에도 불일치 시)
 
@@ -717,11 +726,14 @@ def mark_unverified(report: str, mismatches: list[dict]) -> str:
             m["marked"] = m["surface"] in head
             head = head.replace(m["surface"], MARK_BAD_CITATION)
             continue
-        # 같은 표현의 첫 등장 한 곳에만 표시. 앞뒤가 숫자인 경우(1200 속의 120)는 건너뛴다
+        # 같은 표현의 첫 등장 한 곳에만 표시. 앞뒤가 숫자인 경우(1200 속의 120)는 건너뛴다.
+        # 기준표 원문을 옮긴 표 칸('수십억 달러 이상 규모')은 검사에서 빼므로 표시도 건너뛰고 본문 쪽에 붙인다
         pattern = re.compile(r"(?<![\d.,])" + re.escape(m["surface"])
                              + r"(?![\d])(?!" + re.escape(MARK_UNVERIFIED) + ")")
-        head, count = pattern.subn(lambda x: x.group(0) + MARK_UNVERIFIED, head, count=1)
-        m["marked"] = m.get("marked", False) or bool(count)
+        target = next((x for x in pattern.finditer(head) if not _in_rubric_cell(head, x.start(), m["surface"])), None)
+        if target:
+            head = head[:target.end()] + MARK_UNVERIFIED + head[target.end():]
+        m["marked"] = m.get("marked", False) or bool(target)
     return head + sep + tail
 
 
@@ -838,6 +850,10 @@ def verifier_node(state: dict, judge_llm=None, retriever=None) -> dict:
     mismatches += find_wording_problems(report, state)
     mismatches += check_citations(report)
     mismatches += check_total_score(scores)
+    if _is_recommend_mode(state):   # '추천 기업 없음' 보고서는 여러 후보 점수를 다뤄 마지막 후보 점수와 대조할 수 없다
+        mismatches += [{"kind": "number", "value": m["surface"], "surface": m["surface"],
+                        "context": f"점수표의 {m['label']}은 {m['actual']}점 · " + _context(report, m["pos"])}
+                       for m in score_claim_mismatches(report, scores)]
 
     judge = _resolve_judge(judge_llm)
 
