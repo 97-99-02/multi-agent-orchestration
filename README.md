@@ -3,16 +3,23 @@
 ## 목차
 
 1. [Overview](#overview)
-2. [Selected Technologies](#selected-technologies)
-3. [Features](#features)
-4. [Tech Stack](#tech-stack)
-5. [Agents](#agents)
-6. [State Schema](#state-schema)
-7. [Architecture](#architecture)
-8. [Evaluation & Validation](#evaluation--validation)
-9. [Directory Structure](#directory-structure)
-10. [Usage](#usage)
-11. [Contributors](#contributors)
+2. [시각화](#시각화)
+3. [Selected Technologies](#selected-technologies)
+4. [Features](#features)
+5. [Tech Stack](#tech-stack)
+6. [Agents](#agents)
+7. [State Schema](#state-schema)
+8. [Architecture](#architecture)
+9. [보고서 품질 평가](#보고서-품질-평가)
+10. [투자 판단 기준](#투자-판단-기준)
+11. [LangSmith Tracing](#langsmith-tracing)
+12. [Evaluation & Validation](#evaluation--validation)
+13. [실행 결과와 재현성](#실행-결과와-재현성)
+14. [투자 보고서 핵심 포인트](#투자-보고서-핵심-포인트)
+15. [Directory Structure](#directory-structure)
+16. [Usage](#usage)
+17. [Lessons Learned](#lessons-learned)
+18. [Contributors](#contributors)
 
 본 프로젝트는 국내 AI 반도체 스타트업을 발굴하고, 기술 성숙도·시장성·이해관계자·도메인 적용 관점에서 근거를 모아 투자 적합성을 평가하는 **Supervisor 패턴** 기반 Multi-Agent 시스템이다. 근거가 충분한지 Supervisor가 판단한 뒤에만 보고서를 쓰고, 보고서는 사실 검증과 품질 평가를 통과할 때까지 다시 쓴다.
 
@@ -36,7 +43,7 @@
 
 <img width="1410" height="867" alt="image" src="https://github.com/user-attachments/assets/13b5a477-6953-4af0-8684-ceb1ae8bc7da" />
 
-## Evaluation Target
+## Selected Technologies
 - **평가 대상** : 국내 AI 반도체 설계 스타트업 — 비상장, 투자 단계 Seed ~ Series C, Exit 전 (상장 추진·프리IPO·시리즈 D 이상은 제외)
 - **세부 분야** : 데이터센터 · 엣지 · 차량용 · 인프라(메모리·인터커넥트) · 기타. 시장성 수치와 경쟁사는 같은 세부 분야 기준으로 본다
 - **선정 방식** : 고정 검색어(세부 분야별 1개 이상)로 후보를 최대 5곳 발굴하고, 순서대로 평가하다 처음 투자 결정이 나오면 멈춘다. 모두 보류면 '추천 기업 없음' 보고서를 쓴다
@@ -181,19 +188,22 @@ graph TD
 ## LangSmith Tracing
 제출 trace: **`invest-supervisor-8923c8ed`** (trace_id `8923c8ed490c443c843579ffc3825247`, 프로젝트 `ai-startup-investment-agent`). Supervisor 실행 22회.
 
+하위 실행(LLM 호출·검색)을 접어 supervisor와 노드 이름만 보이게 캡처했다. 트리에서는 노드가 위아래로 나열되지만,
+supervisor 바로 다음에 이어진 분석 노드들(tech_summary·market·competitor·team)은 같은 단계에서 병렬로 실행된 것이다.
+
 | 캡처 | supervisor 단계 | 보여 주는 동적 처리 |
 |---|---|---|
-| [tracing-1.png](assets/tracing-1.png) | 전체 | supervisor ↔ 하위 노드만 번갈아 실행되는 Star 구조, 22단계 |
-| [tracing-2.png](assets/tracing-2.png) | 1~4 | 후보 발굴 → iHW 4관점 병렬 → team만 재작업(공개 정보 부족·같은 날 보도) → judge |
-| [tracing-3.png](assets/tracing-3.png) | 5 | iHW 보류(68점) → 다음 후보 엑시나 (supervisor 출력의 `last_decision`) |
-| [tracing-4.png](assets/tracing-4.png) | 6~9 | 엑시나 4관점 병렬 → tech_summary·team 재작업(`rework_request`) → judge(70점, 투자) → reporter |
-| [tracing-5.png](assets/tracing-5.png) | 10~12 | 사실 검증 불일치 1건 → 재작성 → 재검증 |
-| [tracing-6.png](assets/tracing-6.png) | 13~16 | 품질 평가 미달(근거 부족) → tech_summary·team·market 재조사(병렬) → judge 재판단(74점) → 보고서 다시 작성 |
-| [tracing-7.png](assets/tracing-7.png) | 17~22 | 품질 미달 → 재작성 2/2 → 재검증·재평가 → 한도 도달 종료 |
+| [tracing-1.png](docs/tracing-1.png) | 1~6 | 후보 발굴 → iHW 4관점 병렬 → team만 재작업 → judge → 보류 후 다음 후보 탐색 → 엑시나 4관점 시작 |
+| [tracing-2.png](docs/tracing-2.png) | 6~12 | 엑시나 4관점 → team·tech_summary 재작업 → judge(70점, 투자) → reporter → 사실 검증 불일치 → 재작성 → 재검증 |
+| [tracing-3.png](docs/tracing-3.png) | 13~20 | 품질 평가 미달(근거 부족) → market·team·tech_summary 재조사 → judge 재판단(74점) → 보고서 다시 작성 → 검증 → 품질 미달 → 재작성 2/2 |
+| [tracing-4.png](docs/tracing-4.png) | 20~22 | 재검증 → 품질 평가 → 한도 도달 종료 |
+| [tracing-5.png](docs/tracing-5.png) | 3 | supervisor 결정: `last_decision` "[3] team ← 창업자·핵심 인력 공개 정보 부족, 웹 근거가 모두 같은 날 보도 → 재작업", `evidence_status`(관점별 충분 여부·사유·보완 대상) |
+| [tracing-6.png](docs/tracing-6.png) | 5 | supervisor 결정: "[5] explorer ← iHW 보류(68.0점) → 다음 후보 엑시나", `current_index` 1로 이동 |
+| [tracing-7.png](docs/tracing-7.png) | 14 | supervisor 결정: "[14] tech_summary, team, market ← 품질 평가 근거 부족 → 관점 재조사", `reopen_stage` research, `rework_request`(관점별 사유·보완 대상) |
 
 같은 실행의 결정과 사유 전체는 `outputs/decisions/{trace_id}.jsonl`에 있다.
 
-## 평가·검증
+## Evaluation & Validation
 
 ### 1) Embedding 선정 실험
 공개 리더보드 순위가 아니라 우리 문서 풀에서의 검색 성능으로 골랐다. 코드: `eval/embedding/compare.py`
@@ -269,9 +279,8 @@ graph TD
 │   ├── embedding/    # 임베딩 후보 비교 실험
 │   └── market/       # 시장성 평가 정답지, 평가 스크립트, 결과
 ├── tests/            # 단위 테스트 (API 키 없이 실행)
-├── assets/           # README 그림 (LangSmith 캡처 tracing-*.png)
 ├── fonts/            # PDF 한글 글꼴 (Pretendard, SIL OFL)
-├── docs/             # 역할 분담
+├── docs/             # 역할 분담, LangSmith 캡처(tracing-*.png)
 ├── prompts/          # (비어 있음) 프롬프트는 agents/ 각 파일에 있다
 ├── outputs/          # 실행 결과: 보고서(md·PDF), 결정 로그, 체크포인트, 채점 로그 (git 제외)
 ├── state.py          # 공용 State 정의 (제어/페이로드, reducer)
