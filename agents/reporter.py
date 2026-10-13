@@ -37,10 +37,11 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase.ttfonts import TTFError, TTFont
-from reportlab.platypus import (CondPageBreak, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table,
-                                TableStyle)
+from reportlab.platypus import (CondPageBreak, Flowable, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer,
+                                Table, TableStyle)
 from reportlab.platypus.doctemplate import LayoutError
 
+from agents.competitor import NO_COMPARISON, claim_text
 from agents.judge import RUBRIC
 from config import (ALLOWED_ROUNDS, CORE_CAUTION_SCORE, CORE_ITEMS, CORE_MIN_SCORE, INVEST_THRESHOLD,
                     MAX_CANDIDATES, MODEL_ANALYZE)
@@ -59,8 +60,7 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
 1. 제공된 [분석 자료]에 있는 내용과 숫자만 사용합니다. 자료에 없는 숫자·사실은 절대 만들지 않습니다.
 2. 숫자는 자료에 적힌 표기 그대로 옮깁니다. (반올림·단위 변환·추정 금지)
    '수십억 달러', '수천억 원' 같은 어림 표현을 쓰지 말고 자료의 수치를 그대로 씁니다.
-   괄호로 다른 단위의 환산값을 덧붙이지 않습니다. (예: '3,400백만달러(34억 달러)'처럼 쓰지 않습니다)
-   자료에 전망으로 적힌 수치는 '~ 전망'으로 쓰고, 이미 일어난 일처럼 쓰지 않습니다.
+   다른 단위로 바꾼 값을 괄호로 덧붙이지 않습니다. (예: '백만달러' 수치를 '억 달러'로 바꿔 함께 쓰지 않음)
 3. 자료에 정보가 없으면 '정보 부족'이라고 씁니다.
 4. 출력은 마크다운이며, 아래 [목차]의 순서와 제목('## ' 형식)을 그대로 따릅니다.
 5. 맨 앞은 'SUMMARY'입니다. 900자 이내이며, 투자 추천 보고서는 반드시 아래 틀을 그대로 지킵니다.
@@ -70,11 +70,11 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
    **핵심 근거**
    - 근거 (정확히 3개, 줄마다 끝에 출처 번호)
    **핵심 리스크**
-   - 리스크 (정확히 3개)
+   - 리스크 (정확히 3개, 줄마다 끝에 그 리스크를 다룬 출처 번호)
    **확인 필요**
-   - 추가 확인이 필요한 사항 (1~2개). [분석 자료]에 summary_caution이 있으면 그 내용(항목명과 점수)을
-     한 항목으로 반드시 포함합니다. 형식은 '<항목명> <점수>점(<사유>) 확인 필요'이고, 항목명·점수·사유는
-     summary_caution에 적힌 값을 그대로 씁니다. summary_caution이 없으면 그 항목은 쓰지 않고, 항목 점수도 쓰지 않습니다.
+   - 추가 확인이 필요한 사항 (1~2개). 점수를 다시 쓰는 것이 아니라 무엇을 확인해야 하는지 씁니다.
+     [분석 자료]에 summary_caution이 있으면 그 내용(항목명, 점수, 확인할 다음 점수 조건)을 한 항목으로 반드시 포함합니다.
+     항목명·점수는 summary_caution에 적힌 값을 그대로 씁니다. summary_caution이 없으면 그 항목은 쓰지 않고 항목 점수도 쓰지 않습니다.
      보고서 어디에서든 항목 점수를 쓸 때는 scores의 점수와 같아야 합니다.
    [분석 자료]의 키 이름(summary_caution, team_analysis 등)은 본문 어디에도 쓰지 않습니다.
 6. 'REFERENCE' 장은 쓰지 않습니다. (코드가 실제 사용 출처로 자동 첨부합니다.)
@@ -111,12 +111,26 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
     자료가 없으면 그 장에 '정보 부족'이라고 명시하고 없는 내용을 채우지 않습니다.
     '시장성' 장은 세부 분야 전체 수치(sub_market=false)를 먼저 쓰고, sub_market=true 수치(PC·스마트폰 등 하위 시장)는
     '하위 시장 참고 수치'라고 구분해 씁니다. 같은 범위의 수치가 출처마다 다르면 둘 다 출처 번호와 함께 씁니다.
+    시장 수치의 연도는 figures의 year만 씁니다. year가 비어 있으면(year_note: 연도 미상) 연도를 지어내지 말고 '연도 미상'이라고 씁니다.
+    forecast=true 수치는 '~로 전망된다'처럼 전망으로 쓰고, '성장하고 있다' 같은 현재형으로 쓰지 않습니다.
 18. '최적화된 성능', '혁신적인', '획기적인', '탁월한' 같은 회사 홍보 표현을 옮기지 말고, 수치·사실로만 서술합니다.
 19. '사업 리스크' 장의 리스크마다 근거 출처 번호를 붙입니다. (market_risks, competitive_risks, 기술 약점 등 자료에 있는 리스크)
+    scores.risks는 sources에 적힌 출처의 번호를 붙이고, 리스크를 다루지 않는 출처 번호를 붙이지 않습니다.
     유리한 근거만 고르지 말고, 자료에 있는 약점·리스크·반대 근거도 해당 장에 씁니다.
 20. [분석 자료]에 halted가 있으면 평가가 중간에 멈춘 것이므로 '한계점' 장 첫 문장에 그 사유를 그대로 씁니다.
 21. 같은 사실(양산·테이프아웃 시점, 성능·투자 수치 등)은 모든 장에서 같은 값·시점으로 씁니다.
     자료에 시점이 여러 개면 가장 최근 자료의 내용을 쓰고, 계획·목표는 '목표'라고 밝힙니다.
+    제조·양산·테이프아웃·실증은 자료에 완료로 확인된 경우에만 완료형이나 현재형('~로 제조되며')으로 씁니다.
+    확인되지 않았으면 '~로 설계 중', '~ 계획'으로 쓰고, MOU·협약 체결을 실증 완료로 쓰지 않습니다.
+22. '경쟁 구도' 장은 표 자리 아래에 '**확인된 사실**', '**비교 결과**', '**투자 관점 해석**' 소제목 줄로 세 부분을 나눠 씁니다.
+    - 확인된 사실: competitor_analysis의 claims·differentiation에 있는 수치·사실만 출처 번호와 함께 씁니다.
+      speaker가 대상 기업·경쟁사면 '~가 발표했다'처럼 발표 주체를 밝힙니다.
+    - 비교 결과: comparable=true인 수치만 우열을 씁니다. 같은 조건의 비교 자료가 없으면 '같은 조건의 비교 자료가 없어
+      우열을 판단할 수 없다'고 쓰고 not_comparable 항목을 씁니다.
+    - 투자 관점 해석: scores의 경쟁 우위 점수와 근거(기준표 상한 포함)에 맞춰 1~2문장으로 씁니다. 경쟁사 분석 결과를
+      긍정적인 투자 의견으로 바꾸지 않고, 경쟁사가 앞선 점도 함께 씁니다.
+    자료에 없는 평가('충분히 경쟁할 수 있다', '가장 위협적', '최초가 될 가능성')를 덧붙이지 않습니다.
+23. 약어(HBM, CXL 등)는 [분석 자료]에 풀어 쓴 표기가 있을 때만 풀어 쓰고, 없으면 약어 그대로 씁니다.
 """
 
 # 투자 추천 기업이 있을 때의 목차
@@ -125,7 +139,7 @@ TOC_RECOMMEND = """## SUMMARY (위 5번 틀 그대로)
 ## 2. 시장성 (세부 분야 시장 규모·성장률, 수요 요인)
 ## 3. 이해관계자 (창업자·핵심 인력, 투자사·투자 조건)
 ## 4. 도메인 적용 (고객·PoC·공급 계약 등 실적, 적용 분야)
-## 5. 경쟁 구도 (자리 {{COMPETITOR_TABLE}} + 경쟁 구도가 투자 판단에 주는 의미 2~3문장)
+## 5. 경쟁 구도 (자리 {{COMPETITOR_TABLE}} + 위 22번의 세 부분: 확인된 사실 / 비교 결과 / 투자 관점 해석)
 ## 6. 투자 판단 결과 (점수표 자리 {{SCORE_TABLE}} + 항목별 근거 해설)
 ## 7. 사업 리스크 (시장·기술·규제·경쟁, 리스크마다 출처 번호)
 ## 8. 한계점 ('정보 부족' 항목, '확인 필요' 수치, 보류·제외 기업과 사유)"""
@@ -247,6 +261,7 @@ STRENGTH_HEADER, RISK_HEADER = "차별점(강점)", "경쟁 리스크"   # 2칸 
 TIMELINE_HEADER = "보도일"                            # 1장 개발 단계 타임라인
 RUBRIC_POSITION_HEADER = "채점 항목"                  # 6장 기준표 대비 위치
 SCORE_BASIS_HEADER = "판단 항목"                      # 6장 항목별 판단 근거
+COMPARISON_HEADER = "경쟁사"                          # 5장 경쟁 구도 그림 아래 비교 근거 표 (PDF)
 TIMELINE_CAPTION = "**개발 단계 보도 시점** (기사 게시일 순, 사건 시점과 다를 수 있음)"
 RUBRIC_POSITION_CAPTION = "**기준표 대비 위치** (현재 점수 구간과 다음 점수 조건)"
 SCORE_BASIS_CAPTION = "**항목별 판단 근거**"
@@ -332,10 +347,17 @@ def cautions_of(scores: dict) -> list[dict]:
 
 
 def caution_summary_hint(scores: dict) -> str:
-    """SUMMARY '확인 필요'에 쓸 주의 문구(항목명·점수·이유만, 짧게). 주의가 없으면 빈 문자열."""
-    return ", ".join(
-        f"{c.get('label', c.get('item', ''))} {c.get('score', '')}점" + ("(정보 부족으로 제한)" if c.get("insufficient") else "")
-        for c in cautions_of(scores))
+    """SUMMARY '확인 필요'에 쓸 주의 문구: 항목명·점수와 확인할 다음 점수 조건. 주의가 없으면 빈 문자열.
+    왜: '기술·제품 성숙도 2점 확인 필요'처럼 점수만 되풀이해 무엇을 확인할지 알 수 없었다."""
+    levels = rubric_levels()
+    hints = []
+    for c in cautions_of(scores):
+        label, score = c.get("label", c.get("item", "")), c.get("score", 0)
+        nxt = levels.get(c.get("item", ""), [])[score] if isinstance(score, int) and 0 < score < 5 else ""
+        reason = "정보 부족으로 제한" if c.get("insufficient") else "낮은 평가"
+        hints.append(f"{label} {score}점({reason}): {score + 1}점 조건인 '{nxt}' 충족 여부 확인 필요" if nxt
+                     else f"{label} {score}점({reason}) 근거 확인 필요")
+    return ", ".join(hints)
 
 
 def build_decision_checks(scores: dict) -> list[str]:
@@ -415,33 +437,56 @@ def _cell(text) -> str:
     return (text or "–").replace("|", "/").replace("\n", " ").strip()
 
 
-def build_competitor_table(state: dict) -> str:
+EXCLUDED_PREFIX = "다른 세부 분야라 비교에서 제외"
+NOT_COMPARABLE_PREFIX = "직접 비교할 수 없는 항목"
+
+
+def _claims_cell(claims: list, sources: list[dict], target: str, owner: str = "") -> str:
+    """경쟁사 분석의 주장들을 표 칸 하나로: 문장(발표 주체) + 보고서 출처 번호. 예전 결과(문자열)는 그대로."""
+    parts = []
+    for c in claims:
+        if isinstance(c, dict):
+            cite = _citations_for_urls(sources, [c.get("url", "")]) if c.get("url") else ""
+            parts.append(f"{_cell(claim_text(c, target, owner))} {cite}".strip())
+        else:
+            parts.append(_cell(c))
+    return " ".join(parts)
+
+
+def build_competitor_table(state: dict, sources: list[dict] | None = None) -> str:
     """5장 경쟁 구도: ① 구도 표(평가 대상·선도 기업·동급 기업) ② 차별점·경쟁 리스크 표. 값은 competitor_analysis 그대로.
 
     마크다운에서는 표로 읽히고, PDF에서는 첫 칸 제목('구분'/'차별점')을 보고 구도 그림과 2칸 패널로 그린다.
+    비교·차별점은 경쟁사 분석이 확인한 주장만, 발표 주체와 출처 번호를 붙여 쓴다.
     """
     analysis = state.get("competitor_analysis") or {}
     company = state.get("company") or {}
+    sources = sources or []
+    target = company.get(COMPANY_NAME_KEY) or ""
     competitors = sorted(analysis.get("competitors") or [], key=lambda c: c.get("tier") != LEADING_TIER)
     if not competitors:
         return "(같은 세부 분야에서 비교할 경쟁사를 찾지 못했습니다.)"
     country = "한국" if company.get("is_domestic") else ""
-    lines = [f"| {LANDSCAPE_HEADER} | 기업 | 국가 | 제품 | 비교 |", "|---|---|---|---|---|",
-             f"| {TARGET_TIER} | {_cell(company.get(COMPANY_NAME_KEY))} | {_cell(country)} "
-             f"| {_cell(company.get('product'))} | – |"]
-    lines += [f"| {_cell(c.get('tier'))} | {_cell(c.get('name'))} | {_cell(c.get('country'))} "
-              f"| {_cell(c.get('product'))} | {_cell(c.get('comparison'))} |" for c in competitors]
+    lines = [f"| {LANDSCAPE_HEADER} | 기업 | 국가 | 제품 | 소개 | 비교 근거 |", "|---|---|---|---|---|---|",
+             f"| {TARGET_TIER} | {_cell(target)} | {_cell(country)} | {_cell(company.get('product'))} | – | – |"]
+    for c in competitors:
+        claims = c.get("claims")
+        compared = (_claims_cell(claims, sources, target, c.get("name", "")) if claims
+                    else NO_COMPARISON if claims is not None else _cell(c.get("comparison")))
+        lines.append(f"| {_cell(c.get('tier'))} | {_cell(c.get('name'))} | {_cell(c.get('country'))} "
+                     f"| {_cell(c.get('product'))} | {_cell(c.get('summary'))} | {compared} |")
 
     strengths, risks = analysis.get("differentiation") or [], analysis.get("competitive_risks") or []
     if strengths or risks:
         lines += ["", f"| {STRENGTH_HEADER} | {RISK_HEADER} |", "|---|---|"]
         for i in range(max(len(strengths), len(risks))):
-            left = _cell(strengths[i]) if i < len(strengths) else ""
+            left = _claims_cell([strengths[i]], sources, target) if i < len(strengths) else ""
             right = _cell(risks[i]) if i < len(risks) else ""
             lines.append(f"| {left} | {right} |")
-    excluded = analysis.get("excluded_other_segment") or []
-    if excluded:
-        lines += ["", f"다른 세부 분야라 비교에서 제외: {', '.join(excluded)}"]
+    for prefix, items in ((NOT_COMPARABLE_PREFIX, analysis.get("not_comparable")),
+                          (EXCLUDED_PREFIX, analysis.get("excluded_other_segment"))):
+        if items:
+            lines += ["", f"{prefix}: {'; '.join(_cell(x) for x in items)}"]
     return "\n".join(lines)
 
 
@@ -485,10 +530,11 @@ def _insert_table(body: str, placeholder: str, table: str, section: re.Pattern, 
     return body
 
 
-def insert_competitor_table(body: str, state: dict) -> str:
+def insert_competitor_table(body: str, state: dict, sources: list[dict] | None = None) -> str:
     """5장의 자리표시자를 경쟁사 표로 바꾼다. 자리표시자가 없으면 5장 제목 아래에 넣는다.
-    (경쟁사 출처 번호는 표 아래 해설 문장에 보고서 LLM이 붙인다. 번호만 나열한 줄은 사실 검증이 주장 없는 문장으로 잡았다)"""
-    return _insert_table(body, COMPETITOR_PLACEHOLDER, build_competitor_table(state), COMPETITOR_SECTION_PATTERN, "경쟁사 표")
+    (번호만 나열한 출처 줄은 사실 검증이 주장 없는 문장으로 잡아, 출처 번호는 주장마다 붙인다)"""
+    return _insert_table(body, COMPETITOR_PLACEHOLDER, build_competitor_table(state, sources),
+                         COMPETITOR_SECTION_PATTERN, "경쟁사 표")
 
 
 def _citations_for_urls(sources: list[dict], urls: list[str]) -> str:
@@ -755,6 +801,9 @@ def score_claim_mismatches(report: str, scores: dict) -> list[dict]:
     return found
 
 
+COMPETITION_PARTS = ("**확인된 사실**", "**비교 결과**", "**투자 관점 해석**")   # 5장 세 부분 (규칙 22)
+
+
 def check_format(report: str, structured_summary: bool = False,
                  summary_names: list[str] | tuple = (), summary_cautions: list[str] | tuple = (),
                  scores: dict | None = None) -> list[str]:
@@ -793,6 +842,12 @@ def check_format(report: str, structured_summary: bool = False,
 
     if "REFERENCE" not in last_title.upper():
         violations.append(f"맨 뒤 장이 REFERENCE가 아닙니다(현재: '{last_title}').")
+    if structured_summary:   # 투자 추천 보고서: 경쟁 구도 장을 사실·비교·해석으로 나눴는지
+        competition = next((body for title, body in sections if "경쟁 구도" in title), None)
+        missing = [p.strip("*") for p in COMPETITION_PARTS if competition is not None and p not in competition]
+        if missing:
+            violations.append(f"'경쟁 구도' 장에 소제목이 빠졌습니다: {', '.join(missing)}. "
+                              f"확인된 사실 / 비교 결과 / 투자 관점 해석으로 나눠 쓰세요.")
 
     limit = PAGE_CHARS * MAX_PAGES
     if len(report) > limit:
@@ -893,7 +948,7 @@ def assemble_report(state: dict, body: str, sources: list[dict]) -> str:
     if _is_recommend_mode(state):
         body = insert_score_table(body, state["scores"])
         body = insert_score_basis_tables(body, state["scores"], sources)
-        body = insert_competitor_table(body, state)
+        body = insert_competitor_table(body, state, sources)
         body = insert_timeline_table(body, state, sources)
         body, sources = keep_cited_sources(body, sources)   # REFERENCE에는 본문에서 인용한 출처만
     else:  # 추천 없음 보고서: 점수표·경쟁사 표 대신 2장에 후보별 결과 표(코드가 State에서 만든다)
@@ -968,7 +1023,7 @@ def previous_body(state: dict, sources: list[dict]) -> str:
         text = _strip_code_tables(text)
         if any(k in title for k in TABLE_CHAPTERS):   # 코드가 넣은 표를 지우고 자리 표시로
             kept = [ln for ln in text.splitlines() if not ln.strip().startswith("|")
-                    and not ln.startswith("다른 세부 분야라 비교에서 제외")]
+                    and not ln.startswith((EXCLUDED_PREFIX, NOT_COMPARABLE_PREFIX))]
             mark = COMPETITOR_PLACEHOLDER if "경쟁 구도" in title else PLACEHOLDER
             text = "\n" + mark + "\n" + "\n".join(kept).strip() + "\n"
         chapters.append(f"## {title}\n{text.strip()}\n")
@@ -1128,11 +1183,16 @@ LINE_RATIO = 1.8                               # 줄 간격 (글자 크기 배�
 PARA_GAP, BULLET_GAP = 7, 3                    # 문단·글머리표 뒤 간격(pt)
 SECTION_GAP, HEADING_GAP = 18, 8               # 장 제목 앞·뒤 간격(pt)
 # 이 장들은 쪽에 남은 공간이 PAGE_BREAK_ROOM보다 적으면 새 쪽에서 시작한다 (강제로 넘기면 앞 장의 마지막
-# 한두 줄만 있는 빈 쪽이 생겼다). REFERENCE도 같은 기준. 본문 1장은 항상 새 쪽 (1쪽은 제목 밴드·SUMMARY·대시보드만)
+# 한두 줄만 있는 빈 쪽이 생겼다). 본문 1장은 항상 새 쪽 (1쪽은 제목 밴드·SUMMARY·대시보드만)
 PAGE_BREAK_BEFORE = ("경쟁 구도", "투자 판단 결과")
 PAGE_BREAK_ROOM = 0.3
+# REFERENCE는 제목과 출처 두세 줄이 들어갈 공간만 있으면 이어서 쓴다 (30%면 한계점 뒤 30% 가까이 비고 출처가 다음 쪽으로 밀렸다)
+REFERENCE_ROOM = 0.12
 BODY_START_ROOM = 0.6   # 본문 1장: 쪽에 남은 공간이 60%보다 적으면(=1쪽이 SUMMARY·대시보드로 찼으면) 새 쪽
-LAYOUT_SCALES = (1.0, 1.15, 1.3, 1.45, 1.6)       # MIN_PAGES에 못 미치면 간격 배율을 차례로 키워 다시 조판
+LAYOUT_SCALES = (1.0, 1.1, 1.2, 1.3, 1.4, 1.5, 1.6)   # MIN_PAGES에 못 미치거나 마지막 쪽이 거의 비면 간격 배율을 키워 다시 조판
+# 마지막 쪽이 이보다 적게 차면 다른 배율을 찾는다. 최소 쪽수를 맞추려고 배율을 키우다 출처 몇 줄만 넘어간 순간 멈춰,
+# 마지막 쪽이 90% 넘게 빈 7쪽짜리가 나왔다
+LAST_PAGE_MIN_FILL = 0.3
 DASH_HEIGHT = 168                              # 대시보드 카드·차트 높이(pt)
 CARD_RATIO = 0.42                              # 대시보드에서 왼쪽 카드가 차지하는 폭 비율
 SCORE_BAR_W, SCORE_BAR_H = 70, 9
@@ -1144,6 +1204,7 @@ TABLE_FRACS = {                                # 표 첫 칸 제목 → 열 폭 
     TIMELINE_HEADER: (0.14, 0.72, 0.14),        # 개발 단계 타임라인: '내용' 칸을 넓게
     RUBRIC_POSITION_HEADER: (0.17, 0.25, 0.29, 0.29),   # 점수 칸은 점수 막대가 들어가 점수표만큼 넓게
     SCORE_BASIS_HEADER: (0.18, 0.68, 0.14),     # 항목별 판단 근거: '판단 근거' 칸을 넓게
+    COMPARISON_HEADER: (0.2, 0.8),              # 경쟁사 비교 근거
 }
 
 # State 안의 company 키 후보 (팀원 State와 다르면 여기만 수정)
@@ -1324,49 +1385,46 @@ def _column_box(title: str, caption: str, cards: list, width: float, background:
     return box
 
 
-# 경쟁 구도 그림 카드에 싣는 설명·제품 글자 수. 문장 단위로 이 길이까지 싣고, 문장 중간에서는 자르지 않는다
-# (중간에서 자르면 PDF에 '…'로 끝난 문장이 남았다). 한 문장이 HARD 길이를 넘는 드문 경우만 자른다
-CARD_TEXT_CHARS, CARD_PRODUCT_CHARS = 170, 80
-CARD_TEXT_HARD, CARD_PRODUCT_HARD = 260, 120
+CARD_TEXT_CHARS, CARD_PRODUCT_CHARS = 110, 60   # 경쟁 구도 그림 카드에 싣는 설명·제품 글자 수
 SENTENCE_END = re.compile(r"(?<=[.!?])\s|(?<=다\.)")
 
 
-def _short(text: str, limit: int, hard: int | None = None) -> str:
-    """limit 글자 안에 들어가는 만큼 문장 단위로 싣는다. 첫 문장은 limit을 넘어도 hard까지는 그대로 싣고,
-    hard를 넘을 때만 단어 단위로 자른다 (경쟁사 설명이 길면 그림이 한 쪽보다 커져 앞 쪽이 비었다)."""
+def _short(text: str, limit: int) -> str:
+    """첫 문장이 limit 글자 안이면 첫 문장, 아니면 빈 문자열.
+    (중간에 잘라 '…'을 붙이면 읽는 사람이 원문을 알 수 없어, 카드에는 짧은 소개만 싣고 긴 글은 싣지 않는다)"""
     text = (text or "").strip()
-    if not text:
-        return ""
-    sentences = [x.strip() for x in SENTENCE_END.split(text) if x.strip()]
-    kept = sentences[0]
-    for sentence in sentences[1:]:
-        if len(kept) + 1 + len(sentence) > limit:
-            break
-        kept += " " + sentence
-    hard = hard or limit
-    if len(kept) <= hard:
-        return kept
-    cut = kept[:hard].rsplit(" ", 1)[0]
-    return cut.rstrip(",·;:") + "…"
+    first = SENTENCE_END.split(text, maxsplit=1)[0].strip() if text else ""
+    return first if len(first) <= limit else ""
+
+
+def comparison_rows(block: list[str]) -> list[str]:
+    """경쟁 구도 표(새 형식)에서 경쟁사별 비교 근거만 뽑아 2칸 표 줄로. 예전 형식이면 빈 목록 (카드에 비교 문장이 있다)."""
+    header, *rows = _md_rows(block)
+    if len(header) < 6:
+        return []
+    body = [f"| {r[1]} | {r[5]} |" for r in rows if len(r) >= 6 and r[0] != TARGET_TIER]
+    return [f"| {COMPARISON_HEADER} | 비교 근거 (발표 주체, 출처) |", "|---|---|", *body] if body else []
 
 
 def _landscape(block: list[str], styles: dict, width: float) -> Table:
     """경쟁 구도 그림: [선도 기업(진입 위협)] ← [평가 대상] → [동급 기업(직접 경쟁)]."""
-    rows = _md_rows(block)[1:]   # 첫 줄은 제목
+    header, *rows = _md_rows(block)
+    with_intro = len(header) >= 6   # 새 형식: 구분|기업|국가|제품|소개|비교 근거 (예전 보고서는 소개 칸이 없다)
     groups = {LEADING_TIER: [], TARGET_TIER: [], PEER_TIER: []}
     for row in rows:
-        tier, name, country, product, comparison = (row + [""] * 5)[:5]
-        groups[tier if tier in groups else PEER_TIER].append((name, country, product, comparison))
+        tier, name, country, product, intro, comparison = (
+            (row + [""] * 6)[:6] if with_intro else [*(row + [""] * 5)[:4], "", (row + [""] * 5)[4]])
+        groups[tier if tier in groups else PEER_TIER].append((name, country, product, intro, comparison))
 
-    def card(name, country, product, comparison):
+    def card(name, country, product, intro, comparison):
         # 경쟁사 설명이 길면(영문 소개문 등) 그림이 한 쪽 남은 공간보다 커져 통째로 다음 쪽으로 넘어가고
-        # 앞 쪽이 비었다. 그림 카드에는 첫 문장만 짧게 싣는다 (보고서 본문 표에는 전체가 남아 있다)
-        product = _short(product, CARD_PRODUCT_CHARS, CARD_PRODUCT_HARD)
-        comparison = _short(comparison, CARD_TEXT_CHARS, CARD_TEXT_HARD)
+        # 앞 쪽이 비었다. 카드에는 짧은 소개만 싣고, 비교 근거는 그림 아래 표에 출처 번호와 함께 싣는다
+        product = product if len(product) <= CARD_PRODUCT_CHARS else _short(product, CARD_PRODUCT_CHARS)
+        text_line = _short(intro, CARD_TEXT_CHARS) if with_intro else _short(comparison, CARD_TEXT_CHARS)
         meta = " · ".join(v for v in (country, product) if v and v != "–")
         text = f"<b>{_inline(name)}</b>" + (f' <font size="7.5" color="{MUTED}">{_inline(meta)}</font>' if meta else "")
-        if comparison and comparison != "–":
-            text += f'<br/><font size="7.5">{_inline(comparison)}</font>'
+        if text_line and text_line != "–":
+            text += f'<br/><font size="7.5">{_inline(text_line)}</font>'
         return Paragraph(text, styles["cell"])
 
     none = [Paragraph(f'<font color="{MUTED}">해당 기업 없음</font>', styles["cell"])]
@@ -1375,7 +1433,7 @@ def _landscape(block: list[str], styles: dict, width: float) -> Table:
                        [card(*g) for g in groups[LEADING_TIER]] or none, side_w - 2, PANEL, HOLD, styles)
     right = _column_box(f"{PEER_TIER} · 비상장 스타트업", "직접 경쟁 (비슷한 단계)",
                         [card(*g) for g in groups[PEER_TIER]] or none, side_w - 2, PANEL, NAVY, styles)
-    target = groups[TARGET_TIER][0] if groups[TARGET_TIER] else ("", "", "", "")
+    target = groups[TARGET_TIER][0] if groups[TARGET_TIER] else ("", "", "", "", "")
     mid_style = ParagraphStyle("mid", parent=styles["cell"], textColor=colors.white, alignment=1)
     mid = Table([[Paragraph('<font size="7.5">평가 대상</font>', mid_style)],
                  [Paragraph(f'<font size="11"><b>{_inline(target[0])}</b></font>', mid_style)],
@@ -1432,8 +1490,11 @@ def content_flowables(lines: list[str], styles: dict, width: float, font: str) -
             first = _md_rows(block)[0][0] if _md_rows(block) else ""
             if _PLAIN_FIGURES:                 # 저장 재시도: 그림 대신 일반 표
                 flow += [_table(block, styles, width, font), Spacer(1, 4)]
-            elif first == LANDSCAPE_HEADER:    # 경쟁 구도 표 → 구도 그림
+            elif first == LANDSCAPE_HEADER:    # 경쟁 구도 표 → 구도 그림 + 비교 근거 표
                 flow += [Spacer(1, 2), _landscape(block, styles, width), Spacer(1, 6)]
+                evidence = comparison_rows(block)
+                if evidence:
+                    flow += [_table(evidence, styles, width, font), Spacer(1, 6)]
             elif first == STRENGTH_HEADER:     # 차별점·경쟁 리스크 표 → 2칸 패널
                 flow += [_two_panels(block, styles, width), Spacer(1, 6)]
             else:
@@ -1509,19 +1570,21 @@ def render_blocks(blocks: list[dict], font: str, bold: str, width: float, has_da
             heading, gap = _heading2(title, small, width), Spacer(1, _gap(HEADING_GAP))
             heading.keepWithNext = gap.keepWithNext = True  # 제목만 쪽 끝에 홀로 남지 않게
             # 강제로 새 쪽을 열면 한계점 뒤 검증 결과만 있는 반쪽짜리 쪽이 생겨, 공간이 부족할 때만 넘긴다
-            flow += [CondPageBreak(USABLE_PAGE_HEIGHT * PAGE_BREAK_ROOM), Spacer(1, _gap(SECTION_GAP)), heading, gap]
+            flow += [CondPageBreak(USABLE_PAGE_HEIGHT * REFERENCE_ROOM), Spacer(1, _gap(SECTION_GAP)), heading, gap]
             flow += content_flowables(lines, small, width, font)
         elif level == 2:
             body = content_flowables(lines, normal, width, font)
             if "경쟁 구도" in title:
                 # 경쟁 구도 그림·패널은 쪽을 나눌 수 없는 큰 덩어리라, 먼저 오면 앞 쪽 남은 공간이 통째로 비었다.
                 # 해설 문단을 먼저 두어 남은 공간을 채우고 그림은 그 뒤에 둔다
-                text = [f for f in body if not isinstance(f, (Table, Spacer))]
+                # 비교 불가·분야 제외 줄은 비교 근거라 그림 뒤에 둔다
+                text = [f for f in body if not isinstance(f, (Table, Spacer))
+                        and not getattr(f, "text", "").startswith((EXCLUDED_PREFIX, NOT_COMPARABLE_PREFIX))]
                 body = text + [f for f in body if f not in text]
             opener = ([CondPageBreak(USABLE_PAGE_HEIGHT * PAGE_BREAK_ROOM)] if any(k in title for k in PAGE_BREAK_BEFORE)
                       else []) + [Spacer(1, _gap(SECTION_GAP))]
-            flow += opener + [KeepTogether([_heading2(title, normal, width), Spacer(1, _gap(HEADING_GAP))] + body[:2])]
-            flow += body[2:]
+            flow += opener + [KeepTogether([_heading2(title, normal, width), Spacer(1, _gap(HEADING_GAP))] + body[:1])]
+            flow += body[1:]
         elif level == 3 and title.startswith(NOTE_TITLE):
             inner = [Paragraph(_inline(title), small["label"])] + content_flowables(lines, small, width - 24, font)
             flow += [Spacer(1, 6), _panel(inner, width, NOTE_BG, MUTED)]
@@ -1809,6 +1872,36 @@ def _page_decorations(font: str, label: str, counter: dict):
 
 
 # ── PDF 저장 ─────────────────────────────────────────────────
+class _EndMarker(Flowable):
+    """맨 끝에 넣어 마지막 쪽에 남은 높이를 잰다. 높이가 0이라 항상 들어가고, wrap이 받는 높이가 그 쪽에 남은 공간이다."""
+
+    def __init__(self, sink: dict):
+        super().__init__()
+        self.sink = sink
+
+    def wrap(self, avail_width, avail_height):
+        self.sink["left"] = avail_height
+        return 0, 0
+
+    def draw(self):
+        pass
+
+
+def choose_layout_scale(trials: list[tuple[float, int, float]]) -> float:
+    """조판해 본 (배율, 쪽수, 마지막 쪽 채움 비율) 중에서 고른다.
+    ① 최소~최대 쪽이고 마지막 쪽이 LAST_PAGE_MIN_FILL 이상 찬 가장 작은 배율
+    ② 없으면 최소~최대 쪽 중 마지막 쪽이 가장 많이 찬 배율
+    ③ 최소 쪽에 못 미치면 최대 쪽 이내에서 쪽수가 가장 많고 마지막 쪽이 가장 많이 찬 배율"""
+    fit = [t for t in trials if MIN_PAGES <= t[1] <= MAX_PAGES]
+    good = [t for t in fit if t[2] >= LAST_PAGE_MIN_FILL]
+    if good:
+        return min(good)[0]
+    if fit:
+        return max(fit, key=lambda t: t[2])[0]
+    within = [t for t in trials if t[1] <= MAX_PAGES] or trials
+    return max(within, key=lambda t: (t[1], t[2]))[0]
+
+
 def export_report_pdf(report: str, output_dir: Path = OUTPUT_DIR, filename: str | None = None,
                       state: dict | None = None, report_date: str | None = None) -> tuple[Path, int]:
     """보고서를 PDF로 저장하고 (저장 경로, 페이지 수)를 돌려준다. MIN_PAGES~MAX_PAGES를 벗어나면 경고한다.
@@ -1853,11 +1946,12 @@ def export_report_pdf(report: str, output_dir: Path = OUTPUT_DIR, filename: str 
     company_name = (state.get("company") or {}).get(COMPANY_NAME_KEY, "") if _is_recommend_mode(state) else ""
     label = " · ".join(v for v in ("AI 스타트업 투자 평가", company_name) if v)
     def build() -> dict:
-        counter = {"n": 0}
+        counter = {"n": 0, "left": 0.0}
         first, later = _page_decorations(font, label, counter)
         doc = SimpleDocTemplate(str(path), pagesize=A4, leftMargin=PAGE_MARGIN, rightMargin=PAGE_MARGIN,
                                 topMargin=PAGE_MARGIN, bottomMargin=PAGE_MARGIN + BOTTOM_EXTRA, title=path.stem)
-        doc.build(make_story(), onFirstPage=first, onLaterPages=later)
+        doc.build(make_story() + [_EndMarker(counter)], onFirstPage=first, onLaterPages=later)
+        counter["fill"] = 1 - counter["left"] / USABLE_PAGE_HEIGHT   # 마지막 쪽이 찬 비율
         return counter
 
     global _PLAIN_FIGURES, _LAYOUT_SCALE
@@ -1874,23 +1968,23 @@ def export_report_pdf(report: str, output_dir: Path = OUTPUT_DIR, filename: str 
             finally:
                 _PLAIN_FIGURES = False
 
-    # 최소 쪽수(MIN_PAGES)에 못 미치면 간격 배율을 키워 다시 조판한다. 최대 쪽수를 넘기 직전 배율에서 멈춘다
+    # 간격 배율을 차례로 키워 조판해 보고, 최소~최대 쪽이면서 마지막 쪽이 충분히 찬 배율을 고른다 (choose_layout_scale)
     try:
-        counter, used = build_once(), LAYOUT_SCALES[0]
-        for scale in LAYOUT_SCALES[1:]:
-            if counter["n"] >= MIN_PAGES:
-                break
+        trials = []
+        for scale in LAYOUT_SCALES:
             _LAYOUT_SCALE = scale
-            trial = build_once()
-            if trial["n"] > MAX_PAGES:
-                _LAYOUT_SCALE = used
-                counter = build_once()   # 넘친 배율 대신 직전 배율로 다시 저장
-                break
-            counter, used = trial, scale
+            counter = build_once()
+            trials.append((scale, counter["n"], counter["fill"]))
+            if counter["n"] > MAX_PAGES or (counter["n"] >= MIN_PAGES and counter["fill"] >= LAST_PAGE_MIN_FILL):
+                break   # 넘쳤거나 조건을 채웠으면 더 키우지 않는다
+        used = choose_layout_scale(trials)
+        if used != trials[-1][0]:
+            _LAYOUT_SCALE = used
+            counter = build_once()   # 고른 배율로 다시 저장 (파일은 마지막으로 조판한 것이 남는다)
     finally:
         _LAYOUT_SCALE = 1.0
-    if used != LAYOUT_SCALES[0]:
-        logger.info("[PDF] 최소 %d장을 맞추려고 간격 배율 %.2f로 조판", MIN_PAGES, used)
+    logger.info("[PDF] 간격 배율 %.2f로 조판 (%d쪽, 마지막 쪽 %.0f%% 참). 시도: %s", used, counter["n"], counter["fill"] * 100,
+                ", ".join(f"x{t[0]:g}={t[1]}쪽/{t[2]:.0%}" for t in trials))
 
     pages = counter["n"]
     if pages < MIN_PAGES:

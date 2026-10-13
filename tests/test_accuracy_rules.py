@@ -32,11 +32,6 @@ def test_competitor_prompt_has_today_and_time_rules():
     assert "오늘은 2026-10-13다" in prompt and "당초" in prompt and "가장 최근인 기사" in prompt
 
 
-def test_competitor_differentiation_drops_funding_info():
-    analysis = {"differentiation": ["누적 투자금액 약 700억원에 달한다", "시리즈B 1500억 원 유치", "기업가치 8000억원",
-                                    "CXL 3.0 기반 SoC를 개발한다", "Series B 라운드", "PCIe 6.0을 지원한다"]}
-    assert competitor._drop_funding(analysis)["differentiation"] == ["CXL 3.0 기반 SoC를 개발한다", "PCIe 6.0을 지원한다"]
-
 
 def test_every_internal_name_checked_by_quality_has_a_report_label():
     from agents import quality, reporter
@@ -94,17 +89,21 @@ def test_summary_rule_has_no_copyable_example_score():
 # ---------- 경쟁사 차별점은 평가 대상 기업 것만 ----------
 def test_differentiation_keeps_only_target_company_facts():
     analysis = {"competitors": [{"name": "Qualcomm Technologies, Inc."}, {"name": "Groq"}, {"name": "엑시나 (XCENA)"}],
-                "differentiation": ["Groq는 LPU로 초저지연 추론을 지원한다.", "Qualcomm AI200 칩은 대용량 메모리를 지원한다.",
-                                    "엑시나는 CXL 3.0 SoC를 개발한다.", "하이퍼엑셀은 LPDDR5X 대역폭을 90% 활용한다.",
-                                    "엔비디아 H100 대비 에너지 효율 1.33배", "Groq보다 전력 효율이 높다.", "자체 프레임워크 보유"]}
-    kept = competitor._keep_own_differentiation(analysis, "하이퍼엑셀")["differentiation"]
+                "differentiation": [{"text": t, "kind": "성능", "basis": "사실", "speaker": "제3자"} for t in (
+                    "Groq는 LPU로 초저지연 추론을 지원한다.", "Qualcomm AI200 칩은 대용량 메모리를 지원한다.",
+                    "엑시나는 CXL 3.0 SoC를 개발한다.", "하이퍼엑셀은 LPDDR5X 대역폭을 90% 활용한다.",
+                    "엔비디아 H100 대비 에너지 효율 1.33배", "Groq보다 전력 효율이 높다.", "자체 프레임워크 보유")]}
+    kept = [d["text"] for d in competitor._keep_own_differentiation(analysis, "하이퍼엑셀")["differentiation"]]
     assert kept == ["하이퍼엑셀은 LPDDR5X 대역폭을 90% 활용한다.", "엔비디아 H100 대비 에너지 효율 1.33배",
                     "Groq보다 전력 효율이 높다.", "자체 프레임워크 보유"]
+    # 예전 형식(문자열 목록) 결과도 같은 기준으로 거른다
+    legacy = {"competitors": [{"name": "Groq"}], "differentiation": ["Groq는 LPU를 만든다.", "자체 SDK 보유"]}
+    assert competitor._keep_own_differentiation(legacy, "하이퍼엑셀")["differentiation"] == ["자체 SDK 보유"]
 
 
 def test_competitor_prompts_say_differentiation_is_target_only():
     prompt = competitor.PROMPT.format(name="하이퍼엑셀", segment="데이터센터", product="LPU", today="2026-10-13", results="")
-    assert "'하이퍼엑셀' 자신의 기술·제품·고객 사실만" in prompt
+    assert "'하이퍼엑셀' 자신의 사실만" in prompt and "오늘은 2026-10-13다" in prompt
     assert "경쟁사를 주어로 한 문장은 차별점에 넣지 않는다" in competitor.TIER_NOTE
 
 

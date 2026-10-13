@@ -28,7 +28,7 @@ def analyzed(**over):
         "company": {"name": "A사"}, "is_eligible": True,
         "tech_summary": {"missing_fields": ["weaknesses"]},
         "market_analysis": {"info_insufficient": False},
-        "competitor_analysis": {"competitors": [{"name": "C사"}]},
+        "competitor_analysis": {"competitors": [{"name": "C사", "claims": [{"text": "TOPS 수치", "basis": "수치"}]}]},
         "team_analysis": {"members": [{"name": "홍길동"}], "concerns": []},
         "sources": good_sources(),
     }
@@ -119,6 +119,21 @@ def test_competitor_without_competitors_is_insufficient():
     nxt, _, upd = decide(analyzed(competitor_analysis={"competitors": []}))
     assert nxt == ["competitor"]
     assert upd["rework_request"]["competitor"]["focus"] == ["english_keywords"]
+
+
+def test_competitors_without_checked_comparison_are_insufficient():
+    # 경쟁사 수·출처 수를 채워도 원문으로 확인된 비교 주장이 없으면 완료로 보지 않는다
+    nxt, _, upd = decide(analyzed(competitor_analysis={"competitors": [{"name": "C사", "claims": []}]}))
+    assert nxt == ["competitor"]
+    assert upd["rework_request"]["competitor"]["focus"] == ["comparison_evidence"]
+    assert "비교 주장 없음" in upd["evidence_status"]["competitor"]["reason"]
+
+
+def test_no_comparison_after_rework_goes_to_judge_as_insufficient():
+    state = analyzed(competitor_analysis={"competitors": [{"name": "C사", "claims": []}]}, rework_count={"competitor": MAX_REWORK})
+    nxt, why, upd = decide(state)
+    assert nxt == ["judge"] and "한도 도달" in why
+    assert upd["evidence_status"]["competitor"]["sufficient"] is False
 
 
 def test_single_publisher_is_insufficient_for_bias_control():

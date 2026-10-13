@@ -263,3 +263,40 @@ def test_judge_prompt_includes_cited_source_snippets():
     judge = FakeJudge()
     node(report, state=state, judge_llm=judge)
     assert "[1] 대표는 해외 대비 3~4년 지연" in judge.prompts[0]
+
+
+# ---------- 3차 피드백 (F4) ----------
+def test_summary_risk_bullets_need_citations():
+    summary = ("## SUMMARY\n**결론:** 투자.\n**핵심 근거**\n- 80 TOPS 칩[1]\n- 시장 성장[2]\n- 팀 경력[5]\n"
+               "**핵심 리스크**\n- 양산 지연 가능성[3]\n- 대기업 진입\n- 자금 소진 속도\n**확인 필요**\n- 없음\n")
+    reasons = node(make_report(summary=summary))["items"]["groundedness"]["reasons"]
+    assert any("SUMMARY 핵심 리스크 3개 중 2개에 출처 번호 없음" in r for r in reasons)
+    assert not any("핵심 근거" in r for r in reasons)
+
+
+def test_insufficient_score_statement_must_match_scores():
+    # 지수 실행: 한계점은 '정보 부족으로 점수가 제한되었다'인데 정보 부족으로 채점된 항목은 없었다
+    limits = (section("6. 사업 리스크", "[2][6]", "경쟁사 3곳이 양산 중")      # REFERENCE 앞에 오도록 리스크 장 뒤에 붙인다
+              + section("8. 한계점", "[1]", "팀 규모는 공개되지 않아 정보 부족으로 점수가 제한되었다"))
+    no_insufficient = {**INVEST, "scores": {**INVEST["scores"], "items": {"team": {"score": 4, "insufficient": False}}}}
+    reasons = node(make_report(risk=limits), no_insufficient)["items"]["groundedness"]["reasons"]
+    assert any("정보 부족으로 채점된 항목이 없음" in r for r in reasons)
+    with_insufficient = {**INVEST, "scores": {**INVEST["scores"], "items": {"team": {"score": 2, "insufficient": True}}}}
+    reasons = node(make_report(risk=limits), with_insufficient)["items"]["groundedness"]["reasons"]
+    assert not any("정보 부족으로 채점된" in r for r in reasons)
+
+
+def test_judge_checks_company_statements_and_stronger_conclusions():
+    assert "회사(대표 인터뷰·보도자료)가 한 말을 '평가된다'" in q.JUDGE_PROMPT
+    assert "원문보다 강한 결론" in q.JUDGE_PROMPT and "리스크 문장 포함" in q.JUDGE_PROMPT
+
+
+def test_acronym_expansion_must_be_in_materials():
+    # 지수 실행: 자료에 없는 'HBF(High Bandwidth Fabric)'를 LLM이 지어 썼다
+    market = section("2. 시장성", "[2][4]", "HBF(High Bandwidth Fabric) 시장은 2030년 120억 달러 규모")
+    state = {**INVEST, "market_analysis": {"figures": [{"scope": "HBF 시장", "value": "120억 달러"}]}}
+    reasons = node(make_report(market=market), state)["items"]["groundedness"]["reasons"]
+    assert "자료에 없는 약어 풀이 'HBF(High Bandwidth Fabric)'" in reasons
+    sourced = {**state, "sources": [{"company": "A사", "snippet": "HBF(High Bandwidth Flash)는 낸드 기반"}]}
+    market = section("2. 시장성", "[2][4]", "HBF(High Bandwidth Flash) 시장은 2030년 120억 달러 규모")
+    assert not any("약어" in r for r in node(make_report(market=market), sourced)["items"]["groundedness"]["reasons"])
