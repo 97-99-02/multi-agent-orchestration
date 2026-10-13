@@ -158,6 +158,14 @@ FIX_NOTES_TEMPLATE = """[수정 요청] 직전 보고서에서 아래 항목이 
 """
 
 # 과제 조건(분량·순서·SUMMARY 틀) 위반으로 '형식만 고쳐 쓸' 때 붙는 추가 지시
+# 재작성 때 지적된 장만 고치게 하는 지시. 나머지 장은 코드가 직전 보고서 내용으로 되돌린다
+PARTIAL_REWRITE_TEMPLATE = """[부분 재작성] 아래 [직전 보고서]에서 다음 장만 고치세요: {chapters}
+나머지 장은 [직전 보고서]의 내용을 글자 그대로(출처 번호 포함) 옮기세요. 표 자리 표시({{{{SCORE_TABLE}}}} 등)도 그대로 둡니다.
+
+[직전 보고서]
+{previous}
+"""
+
 FORMAT_FIX_TEMPLATE = """[형식 수정 요청] 직전 보고서가 아래 과제 조건을 지키지 않았습니다. 내용은 유지하고 형식만 고치세요.
 {items}
 """
@@ -747,6 +755,91 @@ def _get_llm():
     return init_chat_model(LLM_MODEL, model_provider="openai", temperature=LLM_TEMPERATURE)
 
 
+# ── 지적된 장만 다시 쓰기 ─────────────────────────────────────
+# 재작성 때 보고서 전체를 새로 쓰면 지적받지 않은 장에서 새 오류가 생겼다 (예: 없던 양산 시점 문장).
+# 직전 보고서에서 지적된 장만 새로 쓰고, 나머지 장은 코드가 직전 내용으로 되돌린다.
+TABLE_CHAPTERS = ("경쟁 구도", "투자 판단 결과")   # 표를 코드가 넣는 장: 항상 새 본문을 쓴다
+AUTO_NOTE_HEADINGS = ("### 자동 검증 결과", "### 품질 평가 미달 항목")   # 검증·평가 노드가 붙인 부분 (다시 붙는다)
+UNVERIFIED_MARKS = ("(확인 필요)", "[출처 확인 필요]")
+
+
+def _chapter_key(title: str) -> str:
+    """'5. 경쟁 구도 (설명)' → '경쟁 구도'. 장을 직전 보고서와 맞출 때 쓴다."""
+    return re.sub(r"\s*\(.*?\)\s*$", "", re.sub(r"^\s*\d+\.\s*", "", title)).strip()
+
+
+def _cut_block(text: str, heading: str) -> str:
+    """heading부터 다음 '## '/'### ' 제목 전까지 지운다."""
+    start = text.find(heading)
+    if start < 0:
+        return text
+    nxt = re.search(r"^#{2,3} ", text[start + len(heading):], re.MULTILINE)
+    end = start + len(heading) + nxt.start() if nxt else len(text)
+    return text[:start].rstrip() + "\n" + text[end:]
+
+
+def previous_body(state: dict, sources: list[dict]) -> str:
+    """직전 보고서 본문을 재작성 기준으로 만든다: 출처 번호를 sources_for_citation 번호로 되돌리고,
+    검증·평가 노드가 붙인 부분과 코드가 넣은 표는 빼고 표 자리 표시로 바꾼다."""
+    body, _, reference = (state.get("report") or "").partition(REFERENCE_HEADING)
+    by_text = {s["text"]: s["n"] for s in sources}
+    back = {int(k): by_text.get(t.strip()) for k, t in re.findall(r"^- \[(\d+)\] (.+)$", reference, re.MULTILINE)}
+    body = CITATION_PATTERN.sub(lambda m: f"[{back[int(m.group(1))]}]" if back.get(int(m.group(1))) else "", body)
+    for heading in AUTO_NOTE_HEADINGS:
+        body = _cut_block(body, heading)
+    chapters = []
+    for title, text in _sections(body):
+        if any(k in title for k in TABLE_CHAPTERS):   # 코드가 넣은 표를 지우고 자리 표시로
+            kept = [ln for ln in text.splitlines() if not ln.strip().startswith("|")
+                    and not ln.startswith("다른 세부 분야라 비교에서 제외")]
+            mark = COMPETITOR_PLACEHOLDER if "경쟁 구도" in title else PLACEHOLDER
+            text = "\n" + mark + "\n" + "\n".join(kept).strip() + "\n"
+        chapters.append(f"## {title}\n{text.strip()}\n")
+    return "\n".join(chapters).strip()
+
+
+def flagged_chapters(prev: str, fix_text: str, mismatch_values: list[str]) -> set[str]:
+    """수정 지시가 가리키는 장: 장 이름·'N장'이 지시에 나오거나, 불일치 값·확인 필요 표시가 들어 있는 장."""
+    flagged = set()
+    for title, text in _sections(prev):
+        key, num = _chapter_key(title), re.match(r"\s*(\d+)\.", title)
+        if (key in fix_text or (num and f"{num.group(1)}장" in fix_text)
+                or any(v and v in text for v in mismatch_values) or any(m in text for m in UNVERIFIED_MARKS)):
+            flagged.add(key)
+    return flagged
+
+
+def merge_rewrite(new_body: str, prev: str, flagged: set[str]) -> str:
+    """새 본문에서 지적되지 않은 장(표 장 제외)을 직전 보고서 내용으로 되돌린다."""
+    before = {_chapter_key(t): x for t, x in _sections(prev)}
+    head = new_body[: H2_PATTERN.search(new_body).start()] if H2_PATTERN.search(new_body) else ""
+    out = []
+    for title, text in _sections(new_body):
+        key = _chapter_key(title)
+        if key in before and key not in flagged and not any(k in key for k in TABLE_CHAPTERS):
+            text = before[key]
+        out.append(f"## {title}\n{text.strip()}\n")
+    return (head + "\n".join(out)).strip()
+
+
+def partial_rewrite_plan(state: dict, sources: list[dict]) -> tuple[str, set[str]]:
+    """(직전 본문, 다시 쓸 장). 부분 재작성 대상이 아니면 ("", set()).
+    대상: 직전 보고서(report_version - 1)가 사실 검증·품질 평가에서 미달이고, 근거 부족 재조사로 자료가 바뀐 경우가 아님."""
+    if not state.get("report"):
+        return "", set()
+    previous = (state.get("report_version") or 0) - 1
+    verify, evaluation = state.get("verify_result") or {}, state.get("eval_result") or {}
+    verify_failed = verify.get("report_version") == previous and not verify.get("passed", True)
+    eval_failed = evaluation.get("report_version") == previous and not evaluation.get("passed", True)
+    if not (verify_failed or eval_failed) or evaluation.get("evidence_gaps"):
+        return "", set()   # 재조사 후에는 자료와 점수가 바뀌어 전체를 새로 쓴다
+    prev = previous_body(state, sources)
+    fix_text = (evaluation.get("fix_instructions") or "") if eval_failed else ""
+    values = [m.get("value", "") for m in verify.get("mismatches") or []] if verify_failed else []
+    flagged = flagged_chapters(prev, fix_text, values)
+    return (prev, flagged) if flagged else ("", set())
+
+
 def _verify_fix_notes(state: dict) -> str:
     """사실 검증이 불일치를 찾아 되돌려 보냈다면, 그 목록을 프롬프트에 붙인다."""
     result = state.get("verify_result") or {}
@@ -789,6 +882,10 @@ def reporter_node(state: dict, llm=None) -> dict:
     llm = llm or _get_llm()
 
     verify_notes, format_notes, report = _verify_fix_notes(state) + _quality_fix_notes(state), "", ""
+    prev, flagged = partial_rewrite_plan(state, sources)
+    if flagged:   # 지적된 장만 다시 쓴다 (나머지 장은 아래 merge_rewrite가 직전 내용으로 되돌림)
+        logger.info("[보고서 생성] 부분 재작성: %s", sorted(flagged))
+        verify_notes += PARTIAL_REWRITE_TEMPLATE.format(chapters=", ".join(sorted(flagged)), previous=prev)
     for attempt in range(MAX_FORMAT_FIXES + 1):
         user_prompt = USER_TEMPLATE.format(
             mode=mode, toc=TOC_RECOMMEND if recommend else TOC_NO_RECOMMEND,
@@ -796,7 +893,10 @@ def reporter_node(state: dict, llm=None) -> dict:
         )
         logger.info("[보고서 생성] LLM 호출 (시도 %d)", attempt + 1)
         response = llm.invoke([("system", SYSTEM_PROMPT), ("user", user_prompt)])
-        report = assemble_report(state, response.content.strip(), sources)
+        body = response.content.strip()
+        if flagged:
+            body = merge_rewrite(body, prev, flagged)
+        report = assemble_report(state, body, sources)
 
         violations = check_format(report, structured_summary=recommend,   # 과제 조건을 코드로 점검
                                   summary_names=(state.get("candidates") or []) if recommend else (),

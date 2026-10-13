@@ -116,8 +116,8 @@ def test_no_recommend_report_skips_company_level_checks():
 
 # ---------- LLM Judge (Hybrid) ----------
 class FakeJudge:
-    def __init__(self, fail=(), error=None, gaps=()):
-        self.fail, self.error, self.prompts, self.gaps = set(fail), error, [], list(gaps)
+    def __init__(self, fail=(), error=None, gaps=(), quotes=()):
+        self.fail, self.error, self.prompts, self.gaps, self.quotes = set(fail), error, [], list(gaps), list(quotes)
 
     def with_structured_output(self, schema):
         return self
@@ -130,7 +130,8 @@ class FakeJudge:
         if self.error:
             raise self.error
         return q.QualityJudgement(**{k: q.JudgeItem(passed=k not in self.fail,
-                                                    reasons=["자료의 양산 지연 리스크가 빠짐"] if k in self.fail else [])
+                                                    reasons=["자료의 양산 지연 리스크가 빠짐"] if k in self.fail else [],
+                                                    quotes=self.quotes if k in self.fail else [])
                                      for k in q.ITEMS},
                                   evidence_gaps=[q.EvidenceGap(perspective=p, reason="공개 자료 없음") for p in self.gaps])
 
@@ -229,3 +230,36 @@ def test_same_day_bias_maps_to_perspective_with_same_day_sources():
     state = {**INVEST, "sources": same_day, "team_analysis": {"members": [{"name": "홍길동"}], "concerns": []}}
     result = node(make_report(reference=refs), state=state)
     assert "team" in result["evidence_gaps"] and "같은 날" in result["evidence_gaps"]["team"]
+
+
+
+# ---------- Judge 판정 재확인, 인용 출처 원문 (C단계) ----------
+SUPPORTED = {**INVEST, "tech_summary": {"development_stage": ["레귤러스 2026년 상반기 테이프아웃 계획"]}}
+
+
+def test_quote_with_numbers_and_words_in_materials_is_supported():
+    segments = q.evidence_segments(SUPPORTED)
+    assert q.supported_by_evidence("레귤러스는 2026년 상반기 테이프아웃을 목표로 한다[3].", segments)
+    assert not q.supported_by_evidence("레귤러스는 2024년 하반기 양산을 앞두고 있다.", segments)   # 숫자가 다름
+    assert not q.supported_by_evidence("레귤러스 테이프아웃 상반기", segments)                    # 숫자 없으면 확인 불가
+
+
+def test_judge_unsupported_claim_found_in_materials_is_dropped():
+    judge = FakeJudge(fail={"groundedness"}, quotes=["레귤러스는 2026년 상반기 테이프아웃을 목표로 한다"])
+    result = node(make_report(), state=SUPPORTED, judge_llm=judge)
+    assert result["items"]["groundedness"]["passed"] and result["judge_rechecked"] == 1
+    really_missing = FakeJudge(fail={"groundedness"}, quotes=["2024년 하반기 양산을 앞두고"])
+    result = node(make_report(), state=SUPPORTED, judge_llm=really_missing)
+    assert not result["items"]["groundedness"]["passed"] and result["judge_rechecked"] == 0
+
+
+def test_judge_prompt_includes_cited_source_snippets():
+    from agents import reporter
+    src = {"company": "A사", "node": "team", "kind": "web", "title": "인터뷰", "publisher": "뉴스1",
+           "date": "2026-09-04", "url": "https://news1.kr/1", "snippet": "대표는 해외 대비 3~4년 지연이라고 말했다"}
+    state = {**INVEST, "sources": [src]}
+    text = reporter.collect_sources(state)[0]["text"]
+    report = make_report(reference=f"## REFERENCE\n### 웹페이지\n- [1] {text}\n")
+    judge = FakeJudge()
+    node(report, state=state, judge_llm=judge)
+    assert "[1] 대표는 해외 대비 3~4년 지연" in judge.prompts[0]
