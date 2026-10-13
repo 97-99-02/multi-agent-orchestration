@@ -3,16 +3,23 @@
 ## 목차
 
 1. [Overview](#overview)
-2. [Selected Technologies](#selected-technologies)
-3. [Features](#features)
-4. [Tech Stack](#tech-stack)
-5. [Agents](#agents)
-6. [State Schema](#state-schema)
-7. [Architecture](#architecture)
-8. [Evaluation & Validation](#evaluation--validation)
-9. [Directory Structure](#directory-structure)
-10. [Usage](#usage)
-11. [Contributors](#contributors)
+2. [시각화](#시각화)
+3. [Selected Technologies](#selected-technologies)
+4. [Features](#features)
+5. [Tech Stack](#tech-stack)
+6. [Agents](#agents)
+7. [State Schema](#state-schema)
+8. [Architecture](#architecture)
+9. [보고서 품질 평가](#보고서-품질-평가)
+10. [투자 판단 기준](#투자-판단-기준)
+11. [LangSmith Tracing](#langsmith-tracing)
+12. [Evaluation & Validation](#evaluation--validation)
+13. [실행 결과와 재현성](#실행-결과와-재현성)
+14. [투자 보고서 핵심 포인트](#투자-보고서-핵심-포인트)
+15. [Directory Structure](#directory-structure)
+16. [Usage](#usage)
+17. [Lessons Learned](#lessons-learned)
+18. [Contributors](#contributors)
 
 본 프로젝트는 국내 AI 반도체 스타트업을 발굴하고, 기술 성숙도·시장성·이해관계자·도메인 적용 관점에서 근거를 모아 투자 적합성을 평가하는 **Supervisor 패턴** 기반 Multi-Agent 시스템이다. 근거가 충분한지 Supervisor가 판단한 뒤에만 보고서를 쓰고, 보고서는 사실 검증과 품질 평가를 통과할 때까지 다시 쓴다.
 
@@ -36,7 +43,7 @@
 
 <img width="1410" height="867" alt="image" src="https://github.com/user-attachments/assets/13b5a477-6953-4af0-8684-ceb1ae8bc7da" />
 
-## Evaluation Target
+## Selected Technologies
 - **평가 대상** : 국내 AI 반도체 설계 스타트업 — 비상장, 투자 단계 Seed ~ Series C, Exit 전 (상장 추진·프리IPO·시리즈 D 이상은 제외)
 - **세부 분야** : 데이터센터 · 엣지 · 차량용 · 인프라(메모리·인터커넥트) · 기타. 시장성 수치와 경쟁사는 같은 세부 분야 기준으로 본다
 - **선정 방식** : 고정 검색어(세부 분야별 1개 이상)로 후보를 최대 5곳 발굴하고, 순서대로 평가하다 처음 투자 결정이 나오면 멈춘다. 모두 보류면 '추천 기업 없음' 보고서를 쓴다
@@ -196,7 +203,7 @@ supervisor 바로 다음에 이어진 분석 노드들(tech_summary·market·com
 
 같은 실행의 결정과 사유 전체는 `outputs/decisions/{trace_id}.jsonl`에 있다.
 
-## 평가·검증
+## Evaluation & Validation
 
 ### 1) Embedding 선정 실험
 공개 리더보드 순위가 아니라 우리 문서 풀에서의 검색 성능으로 골랐다. 코드: `eval/embedding/compare.py`
