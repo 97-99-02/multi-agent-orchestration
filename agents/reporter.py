@@ -37,11 +37,12 @@ from reportlab.lib.units import mm
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.cidfonts import UnicodeCIDFont
 from reportlab.pdfbase.ttfonts import TTFError, TTFont
-from reportlab.platypus import KeepTogether, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
+from reportlab.platypus import (CondPageBreak, KeepTogether, PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table,
+                                TableStyle)
 from reportlab.platypus.doctemplate import LayoutError
 
 from config import (ALLOWED_ROUNDS, CORE_CAUTION_SCORE, CORE_ITEMS, CORE_MIN_SCORE, INVEST_THRESHOLD,
-                    MAX_CANDIDATES, MAX_REPORT_RETRY, MODEL_ANALYZE)
+                    MAX_CANDIDATES, MODEL_ANALYZE)
 from config import WEIGHTS as TEAM_WEIGHTS
 
 logger = logging.getLogger(__name__)
@@ -56,6 +57,7 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
 반드시 아래 규칙을 지키세요.
 1. 제공된 [분석 자료]에 있는 내용과 숫자만 사용합니다. 자료에 없는 숫자·사실은 절대 만들지 않습니다.
 2. 숫자는 자료에 적힌 표기 그대로 옮깁니다. (반올림·단위 변환·추정 금지)
+   '수십억 달러', '수천억 원' 같은 어림 표현을 쓰지 말고 자료의 수치를 그대로 씁니다.
 3. 자료에 정보가 없으면 '정보 부족'이라고 씁니다.
 4. 출력은 마크다운이며, 아래 [목차]의 순서와 제목('## ' 형식)을 그대로 따릅니다.
 5. 맨 앞은 'SUMMARY'입니다. 900자 이내이며, 투자 추천 보고서는 반드시 아래 틀을 그대로 지킵니다.
@@ -70,10 +72,13 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
    - 추가 확인이 필요한 사항 (1~2개). [분석 자료]에 summary_caution이 있으면 그 내용(항목명과 점수)을
      한 항목으로 반드시 포함합니다. (예: 기술·제품 성숙도 2점(정보 부족으로 제한) 확인 필요)
 6. 'REFERENCE' 장은 쓰지 않습니다. (코드가 실제 사용 출처로 자동 첨부합니다.)
-7. 본문 전체는 5장(페이지) 이내 분량, 한글 기준 약 8,000자 이내로 간결하게 씁니다.
+7. 본문 전체는 한글 기준 약 10,000~14,000자로 씁니다. (PDF는 대시보드·REFERENCE 포함 7~10장)
+   1~4장(관점 장)은 [분석 자료]에 있는 사실을 빠짐없이 2~4문단으로 자세히 씁니다. 분량을 채우려고 자료에 없는 내용이나
+   같은 말 반복을 넣지 않습니다. 자료가 적은 장은 짧아도 됩니다.
 8. '투자 판단 결과' 장에는 점수표를 직접 쓰지 말고, 표가 들어갈 자리에 {{SCORE_TABLE}} 한 줄만 쓰세요.
    그 아래에 항목별 근거를 문장으로 해설합니다. (표는 코드가 자동으로 채웁니다.)
 9. 수치나 사실을 말하는 문장 끝에는 [분석 자료]의 sources_for_citation에 있는 번호를 [1]처럼 붙이세요.
+   번호가 여러 개면 [1][2]처럼 하나씩 따로 씁니다. ([1,2]·[1-2]처럼 묶지 않습니다)
    목록에 없는 번호는 절대 쓰지 말고, 근거 출처가 없으면 번호를 붙이지 않습니다.
 10. '경쟁 구도' 장에는 경쟁사 목록·차별점·경쟁 리스크를 직접 나열하지 말고, 그 자리에 {{COMPETITOR_TABLE}} 한 줄만 쓰세요.
     (구도 그림과 차별점·리스크 목록은 코드가 자동으로 채웁니다.) 그 아래에는 이 경쟁 구도가 투자 판단에
@@ -92,17 +97,26 @@ SYSTEM_PROMPT = """당신은 AI 반도체 스타트업 투자 보고서를 쓰�
     기업 사실은 웹 출처를, 업계 해석은 연결된 기업 웹 출처와 보고서 출처를 함께 인용합니다.
     conditions_missing은 비교 조건이 부족하다는 뜻이므로 기술 우위·업계 순위로 표현하지 않습니다.
     업계 보고서의 수치를 기업의 양산·매출·계약 실적으로 바꾸지 않습니다.
+17. 1~4장은 평가 관점별 장입니다. 장 제목의 관점 이름(기술 성숙도, 시장성, 이해관계자, 도메인 적용)을 그대로 씁니다.
+    '이해관계자' 장은 창업자·핵심 인력(team_analysis)과 투자사·투자 조건(company의 investors, 투자 금액·기업가치)을,
+    '도메인 적용' 장은 고객·PoC·공급 계약 등 실적(tech_summary의 public_revenue_contracts)과 적용 분야(세부 분야)를 다룹니다.
+    자료가 없으면 그 장에 '정보 부족'이라고 명시하고 없는 내용을 채우지 않습니다.
+18. '최적화된 성능', '혁신적인', '획기적인', '탁월한' 같은 회사 홍보 표현을 옮기지 말고, 수치·사실로만 서술합니다.
+19. '사업 리스크' 장의 리스크마다 근거 출처 번호를 붙입니다. (market_risks, competitive_risks, 기술 약점 등 자료에 있는 리스크)
+    유리한 근거만 고르지 말고, 자료에 있는 약점·리스크·반대 근거도 해당 장에 씁니다.
+20. [분석 자료]에 halted가 있으면 평가가 중간에 멈춘 것이므로 '한계점' 장 첫 문장에 그 사유를 그대로 씁니다.
 """
 
 # 투자 추천 기업이 있을 때의 목차
 TOC_RECOMMEND = """## SUMMARY (위 5번 틀 그대로)
-## 1. 사업 아이디어 (핵심 컨셉)
-## 2. 시장 규모
-## 3. 팀의 구성
-## 4. 경쟁 구도 (자리 {{COMPETITOR_TABLE}} + 경쟁 구도가 투자 판단에 주는 의미 2~3문장)
-## 5. 투자 판단 결과 (점수표 자리 {{SCORE_TABLE}} + 항목별 근거 해설)
-## 6. 사업 리스크 (시장·기술·규제·경쟁)
-## 7. 한계점 ('정보 부족' 항목, '확인 필요' 수치, 보류·제외 기업과 사유)"""
+## 1. 사업 아이디어·기술 성숙도 (핵심 칩, 공정, 개발 단계, 성능)
+## 2. 시장성 (세부 분야 시장 규모·성장률, 수요 요인)
+## 3. 이해관계자 (창업자·핵심 인력, 투자사·투자 조건)
+## 4. 도메인 적용 (고객·PoC·공급 계약 등 실적, 적용 분야)
+## 5. 경쟁 구도 (자리 {{COMPETITOR_TABLE}} + 경쟁 구도가 투자 판단에 주는 의미 2~3문장)
+## 6. 투자 판단 결과 (점수표 자리 {{SCORE_TABLE}} + 항목별 근거 해설)
+## 7. 사업 리스크 (시장·기술·규제·경쟁, 리스크마다 출처 번호)
+## 8. 한계점 ('정보 부족' 항목, '확인 필요' 수치, 보류·제외 기업과 사유)"""
 
 # 모든 후보가 보류/제외되었을 때의 목차
 TOC_NO_RECOMMEND = """## SUMMARY
@@ -123,6 +137,12 @@ USER_TEMPLATE = """[보고서 유형] {mode}
 {fix_notes}
 위 자료만 근거로 보고서를 작성하세요."""
 
+# 품질 평가가 미달로 되돌려 보냈을 때 붙는 추가 지시 (agents/quality.py의 fix_instructions)
+QUALITY_FIX_TEMPLATE = """[품질 수정 요청] 직전 보고서가 품질 평가에서 아래 항목이 미달이었습니다.
+사실을 새로 만들지 말고 [분석 자료] 안에서 고치세요. 근거가 없으면 '정보 부족'으로 쓰세요.
+{items}
+"""
+
 # 사실 검증에서 불일치가 나와 '재작성'할 때만 붙는 추가 지시
 FIX_NOTES_TEMPLATE = """[수정 요청] 직전 보고서에서 아래 항목이 [분석 자료]와 일치하지 않았습니다.
 자료에 있는 값으로 고치거나, 자료에서 확인되지 않으면 그 내용을 빼고 '정보 부족'으로 쓰세요.
@@ -140,7 +160,6 @@ FORMAT_FIX_TEMPLATE = """[형식 수정 요청] 직전 보고서가 아래 과�
 # ═════════════════════════════════════════════════════════════
 LLM_MODEL = MODEL_ANALYZE    # 팀 설정(config.py)을 따른다
 LLM_TEMPERATURE = 0.0          # 0 = 매번 거의 같은 답(재현성). 사실 기반 글이라 창의성 불필요
-MAX_RETRY = MAX_REPORT_RETRY  # 설계 문서: 사실 검증 후 재작성은 최대 1회 (config.py)
 MAX_FORMAT_FIXES = 1           # 과제 조건 위반 시 형식만 고쳐 쓰는 횟수(사실 검증 재작성과 별개)
 
 # 평가표(설계서 3장) — 바뀌면 여기만 고친다. 순서는 보고서 표의 표시 순서이기도 하다
@@ -170,7 +189,8 @@ ANALYSIS_KEYS = (
 # 과제 조건 점검
 SUMMARY_MAX_CHARS = 900     # A4 반 페이지 ≈ 한글 900자 (대략치. 조에서 조정 가능)
 PAGE_CHARS = 1800           # A4 한 페이지 ≈ 한글 1,800자 (대략치)
-MAX_PAGES = 5               # 과제 조건: 5장 이내
+MAX_PAGES = 10              # 과제 조건: 최대 10장 (Agent 과제)
+MIN_PAGES = 7               # 조 기준: 최소 7장 (PDF 조판 간격을 키워 맞춘다, 내용은 늘리지 않음)
 SUMMARY_BULLETS = 3         # SUMMARY 틀: 핵심 근거·핵심 리스크 각 3개
 CONFIRM_BULLETS = (1, 2)    # SUMMARY 틀: 확인 필요 1~2개
 SUMMARY_LABELS = ("**결론:**", "**핵심 근거**", "**핵심 리스크**", "**확인 필요**")
@@ -189,12 +209,14 @@ UNKNOWN_DATE = "날짜 미상"
 REFERENCE_HEADING = "## REFERENCE"
 
 PLACEHOLDER = "{{SCORE_TABLE}}"                      # AI가 쓰는 '표 자리' 표시
-COMPETITOR_PLACEHOLDER = "{{COMPETITOR_TABLE}}"      # 4장 경쟁사 표 자리
+COMPETITOR_PLACEHOLDER = "{{COMPETITOR_TABLE}}"      # 5장 경쟁사 표 자리
 CANDIDATE_PLACEHOLDER = "{{CANDIDATE_TABLE}}"        # '추천 기업 없음' 보고서 2장 후보 표 자리
 SECTION2_PATTERN = re.compile(r"^##\s*2\.[^\n]*\n", re.MULTILINE)
-SECTION4_PATTERN = re.compile(r"^##\s*4\.[^\n]*\n", re.MULTILINE)
-SECTION5_PATTERN = re.compile(r"^##\s*5\.[^\n]*\n", re.MULTILINE)
+COMPETITOR_SECTION_PATTERN = re.compile(r"^##\s*5\.[^\n]*\n", re.MULTILINE)   # 5장 경쟁 구도
+SCORE_SECTION_PATTERN = re.compile(r"^##\s*6\.[^\n]*\n", re.MULTILINE)        # 6장 투자 판단 결과
 HR_PATTERN = re.compile(r"^[ \t]*(?:[-*_][ \t]*){3,}$\n?", re.MULTILINE)  # AI가 넣는 '---' 구분선
+# AI가 묶어 쓴 [6,7]·[8-11]. 세 자리 이하만 (대괄호 안 연도 범위 [2024-2030]은 인용이 아니다)
+GROUPED_CITATION_PATTERN = re.compile(r"\[(\d{1,3}(?:\s*[,~\-]\s*\d{1,3})+)\]")
 LEADING_TIER = "선도 기업"                            # 경쟁 구도에서 왼쪽(진입 위협)에 놓을 구분
 PEER_TIER = "동급 기업"                               # 오른쪽(직접 경쟁)에 놓을 구분
 TARGET_TIER = "평가 대상"
@@ -314,7 +336,7 @@ def _cell(text) -> str:
 
 
 def build_competitor_table(state: dict) -> str:
-    """4장 경쟁 구도: ① 구도 표(평가 대상·선도 기업·동급 기업) ② 차별점·경쟁 리스크 표. 값은 competitor_analysis 그대로.
+    """5장 경쟁 구도: ① 구도 표(평가 대상·선도 기업·동급 기업) ② 차별점·경쟁 리스크 표. 값은 competitor_analysis 그대로.
 
     마크다운에서는 표로 읽히고, PDF에서는 첫 칸 제목('구분'/'차별점')을 보고 구도 그림과 2칸 패널로 그린다.
     """
@@ -359,13 +381,13 @@ def build_candidate_table(state: dict) -> str | None:
 
 
 def insert_score_table(body: str, scores: dict) -> str:
-    """본문의 자리표시자를 점수표로 바꾼다. 자리표시자가 없으면 5장 제목 아래에 넣는다."""
+    """본문의 자리표시자를 점수표로 바꾼다. 자리표시자가 없으면 6장 제목 아래에 넣는다."""
     table = build_score_table(scores)
     if PLACEHOLDER in body:
         return body.replace(PLACEHOLDER, table)
-    match = SECTION5_PATTERN.search(body)
+    match = SCORE_SECTION_PATTERN.search(body)
     if match:
-        logger.warning("[표 생성] 자리표시자가 없어 5장 제목 아래에 표를 삽입")
+        logger.warning("[표 생성] 자리표시자가 없어 6장 제목 아래에 표를 삽입")
         return body[: match.end()] + "\n" + table + "\n" + body[match.end():]
     logger.warning("[표 생성] 삽입 위치를 찾지 못해 본문 끝에 표를 추가")
     return body + "\n\n" + table
@@ -383,9 +405,19 @@ def _insert_table(body: str, placeholder: str, table: str, section: re.Pattern, 
     return body
 
 
-def insert_competitor_table(body: str, state: dict) -> str:
-    """4장의 자리표시자를 경쟁사 표로 바꾼다. 자리표시자가 없으면 4장 제목 아래에 넣는다."""
-    return _insert_table(body, COMPETITOR_PLACEHOLDER, build_competitor_table(state), SECTION4_PATTERN, "경쟁사 표")
+def insert_competitor_table(body: str, state: dict, sources: list[dict] | None = None) -> str:
+    """5장의 자리표시자를 경쟁사 표로 바꾼다. 자리표시자가 없으면 5장 제목 아래에 넣는다.
+    sources를 주면 표 아래에 경쟁사 분석 출처 번호를 붙인다 (표의 점유율·비교 수치를 REFERENCE로 추적할 수 있게)."""
+    table = build_competitor_table(state)
+    numbers = competitor_source_numbers(sources or [])
+    if table and numbers:
+        table += "\n\n경쟁사 정보 출처: " + "".join(f"[{n}]" for n in numbers)
+    return _insert_table(body, COMPETITOR_PLACEHOLDER, table, COMPETITOR_SECTION_PATTERN, "경쟁사 표")
+
+
+def competitor_source_numbers(sources: list[dict]) -> list[int]:
+    """collect_sources 결과 중 경쟁사 분석(node=competitor)이 기록한 출처 번호."""
+    return [s["n"] for s in sources if any(r.get("node") == "competitor" for r in s.get("raw", []))]
 
 
 # ═════════════════════════════════════════════════════════════
@@ -533,7 +565,7 @@ def check_format(report: str, structured_summary: bool = False,
                  summary_names: list[str] | tuple = (), summary_cautions: list[str] | tuple = ()) -> list[str]:
     """과제 조건 위반 목록을 돌려준다. 비어 있으면 모두 통과.
 
-    점검: SUMMARY 맨 앞·길이, REFERENCE 맨 뒤, 전체 5장 이내(글자 수 근사),
+    점검: SUMMARY 맨 앞·길이, REFERENCE 맨 뒤, 전체 MAX_PAGES장 이내(글자 수 근사),
     structured_summary=True면 SUMMARY 고정 틀까지, summary_names가 있으면 SUMMARY에 그 이름(후보)이 모두 있는지,
     summary_cautions가 있으면 SUMMARY '확인 필요'에 그 항목 이름이 있는지.
     (실제 페이지 수는 PDF 저장 때 다시 센다)
@@ -602,7 +634,7 @@ def build_materials(state: dict, sources: list[dict]) -> dict:
         materials["sources_for_citation"] = [
             {"n": s["n"], "type": s["label"], "title": s["title"]} for s in sources
         ]
-        # SUMMARY 결론에 '후보 A, B, C 중 선정'을 쓰게 하려는 것. (평가 순서·사유 표는 코드가 5장에 넣는다)
+        # SUMMARY 결론에 '후보 A, B, C 중 선정'을 쓰게 하려는 것. (평가 순서·사유 표는 코드가 6장에 넣는다)
         materials["selection"] = {"candidates": state.get("candidates") or [],
                                   "selected": state["company"].get(COMPANY_NAME_KEY)}
         hint = caution_summary_hint(state["scores"])
@@ -612,6 +644,8 @@ def build_materials(state: dict, sources: list[dict]) -> dict:
         materials = {"candidates": state.get("candidates") or []}
     materials["rejected"] = state.get("rejected", [])  # 보류·제외 기업과 사유는 한계점에 항상 쓰인다
     materials["evaluation_rules"] = evaluation_rules()  # AI가 기준을 추측해 틀리게 쓰지 않도록
+    if state.get("last_error"):   # supervisor 단계 한도 등으로 평가가 중간에 멈춘 경우 (규칙 19)
+        materials["halted"] = state["last_error"]
     return materials
 
 
@@ -630,13 +664,31 @@ def evaluation_rules() -> dict:
     }
 
 
+def split_grouped_citations(body: str) -> str:
+    """[6,7]·[8-11]을 [6][7]·[8][9][10][11]로 푼다.
+    왜: 번호를 다시 매길 때 [n] 형식만 바뀌어, 묶어 쓴 번호는 옛 번호로 남아 REFERENCE와 어긋났다
+    (사실 검증도 '6,7'을 자료에 없는 수치로 표시했다).
+    """
+    def expand(m):
+        numbers = []
+        for part in re.split(r"\s*,\s*", m.group(1)):
+            bounds = re.split(r"\s*[~\-]\s*", part)
+            if len(bounds) == 2 and int(bounds[0]) <= int(bounds[1]) <= int(bounds[0]) + 20:
+                numbers += range(int(bounds[0]), int(bounds[1]) + 1)
+            else:
+                numbers += [int(b) for b in bounds]
+        return "".join(f"[{n}]" for n in numbers)
+    return GROUPED_CITATION_PATTERN.sub(expand, body)
+
+
 def assemble_report(state: dict, body: str, sources: list[dict]) -> str:
     """AI가 쓴 본문에 코드가 만든 부분(점수표, REFERENCE)을 합쳐 완성본을 만든다."""
     body = REFERENCE_SECTION_PATTERN.sub("", body).rstrip()  # AI가 쓴 REFERENCE는 지운다(진짜는 코드가)
+    body = split_grouped_citations(body)                     # [6,7] → [6][7] (번호 다시 매기기 전에)
     body = HR_PATTERN.sub("", body)                          # '---' 구분선은 PDF에 글자로 찍히므로 지운다
     if _is_recommend_mode(state):
         body = insert_score_table(body, state["scores"])
-        body = insert_competitor_table(body, state)
+        body = insert_competitor_table(body, state, sources)
         body, sources = keep_cited_sources(body, sources)   # REFERENCE에는 본문에서 인용한 출처만
     else:  # 추천 없음 보고서: 점수표·경쟁사 표 대신 2장에 후보별 결과 표(코드가 State에서 만든다)
         body = body.replace(PLACEHOLDER, "").replace(COMPETITOR_PLACEHOLDER, "")
@@ -666,6 +718,15 @@ def _verify_fix_notes(state: dict) -> str:
     return FIX_NOTES_TEMPLATE.format(items=items)
 
 
+def _quality_fix_notes(state: dict) -> str:
+    """직전 보고서(report_version - 1)가 품질 평가에서 미달이었다면 수정 지시를 프롬프트에 붙인다."""
+    result = state.get("eval_result") or {}
+    previous = (state.get("report_version") or 0) - 1
+    if result.get("passed", True) or result.get("report_version") != previous or not result.get("fix_instructions"):
+        return ""
+    return QUALITY_FIX_TEMPLATE.format(items=result["fix_instructions"])
+
+
 def reporter_node(state: dict, llm=None) -> dict:
     """보고서 생성 노드. State를 받아 '바꿀 키만' dict로 돌려준다.
 
@@ -679,20 +740,16 @@ def reporter_node(state: dict, llm=None) -> dict:
     mode = "투자 추천 보고서" if recommend else "추천 기업 없음 보고서"
     logger.info("[보고서 생성] 유형: %s", mode)
 
-    # 재작성 여부: 직전 검증이 실패로 끝났다면 재작성 → 횟수 +1
-    prev = state.get("verify_result") or {}
-    is_rewrite = bool(prev) and not prev.get("passed", True)
-    retry_count = state.get("retry_count", 0) + (1 if is_rewrite else 0)
-    if retry_count > MAX_RETRY:
-        raise ValueError(f"재작성 횟수({retry_count})가 한도({MAX_RETRY})를 넘었습니다.")
-    logger.info("[보고서 생성] 재작성 여부=%s, retry_count=%d", is_rewrite, retry_count)
+    # 재작성 횟수·한도는 supervisor가 관리한다 (제어 키). 여기서는 몇 번째 보고서인지 기록만 한다
+    logger.info("[보고서 생성] report_version=%s, 사실 검증 재작성=%s회, 품질 재작성=%s회",
+                state.get("report_version"), state.get("retry_count", 0), state.get("quality_loops", 0))
 
     sources = collect_sources(state) if recommend else []
     logger.info("[보고서 생성] 사용 가능한 출처 %d건", len(sources))
     materials = json.dumps(build_materials(state, sources), ensure_ascii=False, indent=2)
     llm = llm or _get_llm()
 
-    verify_notes, format_notes, report = _verify_fix_notes(state), "", ""
+    verify_notes, format_notes, report = _verify_fix_notes(state) + _quality_fix_notes(state), "", ""
     for attempt in range(MAX_FORMAT_FIXES + 1):
         user_prompt = USER_TEMPLATE.format(
             mode=mode, toc=TOC_RECOMMEND if recommend else TOC_NO_RECOMMEND,
@@ -714,7 +771,7 @@ def reporter_node(state: dict, llm=None) -> dict:
         logger.warning("[보고서 생성] 형식 수정 후에도 위반이 남았습니다. 현재 본문을 유지합니다.")
 
     logger.info("[보고서 생성] 완료 (%d자)", len(report))
-    return {"report": report, "retry_count": retry_count}
+    return {"report": report}
 
 
 # ═════════════════════════════════════════════════════════════
@@ -749,7 +806,15 @@ PAGE_MARGIN = 16 * mm
 BOTTOM_EXTRA = 4 * mm                          # 바닥글 자리
 USABLE_PAGE_HEIGHT = A4[1] - 2 * PAGE_MARGIN - BOTTOM_EXTRA   # 한 쪽의 본문 높이
 SUMMARY_MAX_PAGE_RATIO = 0.5                   # 과제 조건: SUMMARY는 1/2 페이지 이내
-BODY_SIZE, SMALL_SIZE = 9.5, 8
+BODY_SIZE, SMALL_SIZE = 10, 8.5
+LINE_RATIO = 1.8                               # 줄 간격 (글자 크기 배수)
+PARA_GAP, BULLET_GAP = 7, 3                    # 문단·글머리표 뒤 간격(pt)
+SECTION_GAP, HEADING_GAP = 18, 8               # 장 제목 앞·뒤 간격(pt)
+# 이 장들은 쪽에 남은 공간이 PAGE_BREAK_ROOM보다 적으면 새 쪽에서 시작한다 (강제로 넘기면 앞 장의 마지막
+# 한두 줄만 있는 빈 쪽이 생겼다). REFERENCE와 본문 1장은 항상 새 쪽 (1쪽은 제목 밴드·SUMMARY·대시보드만)
+PAGE_BREAK_BEFORE = ("경쟁 구도", "투자 판단 결과")
+PAGE_BREAK_ROOM = 0.45
+LAYOUT_SCALES = (1.0, 1.15, 1.3, 1.45, 1.6)       # MIN_PAGES에 못 미치면 간격 배율을 차례로 키워 다시 조판
 DASH_HEIGHT = 168                              # 대시보드 카드·차트 높이(pt)
 CARD_RATIO = 0.42                              # 대시보드에서 왼쪽 카드가 차지하는 폭 비율
 SCORE_BAR_W, SCORE_BAR_H = 70, 9
@@ -773,11 +838,11 @@ NOTE_TITLE = "자동 검증 결과"
 # ── 파일명 ───────────────────────────────────────────────────
 def build_output_filename(campus: str = CAMPUS, class_no: str = CLASS_NO,
                           members: list[str] | None = None) -> str:
-    """과제 파일명 규칙: RAG-Output_{캠퍼스}-{X반}_{이름1+이름2+...}.pdf"""
+    """보고서 PDF 파일명: Agent-Output_{캠퍼스}-{X반}_{이름1+이름2+...}.pdf (제출 zip은 Agent_{캠퍼스}_{X반}_{이름...}.zip)"""
     members = members or MEMBERS
     if not members:
         raise ValueError("조원 이름 목록이 비어 있습니다.")
-    return f"RAG-Output_{campus}-{class_no}_{'+'.join(members)}.pdf"
+    return f"Agent-Output_{campus}-{class_no}_{'+'.join(members)}.pdf"
 
 
 # ── 글꼴 ─────────────────────────────────────────────────────
@@ -827,20 +892,28 @@ def _inline(text: str) -> str:
     return re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", text)
 
 
+_LAYOUT_SCALE = 1.0   # export_report_pdf가 MIN_PAGES를 맞추려고 바꾸는 간격 배율
+
+
+def _gap(points: float) -> float:
+    return points * _LAYOUT_SCALE
+
+
 def _styles(font: str, bold: str, size: float = BODY_SIZE) -> dict[str, ParagraphStyle]:
-    """본문 크기(size)에 맞춘 문단 스타일 묶음."""
+    """본문 크기(size)에 맞춘 문단 스타일 묶음. 줄·문단 간격은 _LAYOUT_SCALE배."""
     base = dict(fontName=font, alignment=TA_LEFT, textColor=_hex(INK))
-    lead = size * 1.6
+    lead = size * LINE_RATIO * (1 + (_LAYOUT_SCALE - 1) / 2)   # 줄 간격은 배율의 절반만 키운다
     return {
-        "body": ParagraphStyle("body", fontSize=size, leading=lead, spaceAfter=3, **base),
-        "bullet": ParagraphStyle("bullet", fontSize=size, leading=lead, leftIndent=11, bulletIndent=2, **base),
+        "body": ParagraphStyle("body", fontSize=size, leading=lead, spaceAfter=_gap(PARA_GAP), **base),
+        "bullet": ParagraphStyle("bullet", fontSize=size, leading=lead, leftIndent=11, bulletIndent=2,
+                                 spaceAfter=_gap(BULLET_GAP), **base),
         "sub": ParagraphStyle("sub", fontSize=size - 0.5, leading=lead - 1, leftIndent=24, bulletIndent=14,
                               **{**base, "textColor": _hex(MUTED)}),
         "label": ParagraphStyle("label", fontSize=size, leading=lead, spaceBefore=3,
                                 **{**base, "fontName": bold, "textColor": _hex(NAVY)}),
         "h1": ParagraphStyle("h1", fontSize=16, leading=22, spaceAfter=6, **{**base, "fontName": bold}),
-        "h2": ParagraphStyle("h2", fontSize=12.5, leading=17, **{**base, "fontName": bold, "textColor": _hex(NAVY)}),
-        "h3": ParagraphStyle("h3", fontSize=size + 1, leading=(size + 1) * 1.4, spaceBefore=4, spaceAfter=2,
+        "h2": ParagraphStyle("h2", fontSize=13.5, leading=19, **{**base, "fontName": bold, "textColor": _hex(NAVY)}),
+        "h3": ParagraphStyle("h3", fontSize=size + 1, leading=(size + 1) * 1.4, spaceBefore=_gap(6), spaceAfter=_gap(3),
                              keepWithNext=1, **{**base, "fontName": bold}),   # 소제목이 쪽 끝에 홀로 남지 않게
         "cell": ParagraphStyle("cell", fontSize=size - 0.5, leading=(size - 0.5) * 1.5, **base),
     }
@@ -1069,13 +1142,15 @@ def render_blocks(blocks: list[dict], font: str, bold: str, width: float, has_da
             inner = [Paragraph("SUMMARY", normal["h2"])] + content_flowables(lines, normal, width - 24, font)
             flow += [Spacer(1, 4), _panel(inner, width, PANEL, NAVY)]
         elif level == 2 and "REFERENCE" in upper:
-            heading, gap = _heading2(title, small, width), Spacer(1, 3)
+            heading, gap = _heading2(title, small, width), Spacer(1, _gap(HEADING_GAP))
             heading.keepWithNext = gap.keepWithNext = True  # 제목만 쪽 끝에 홀로 남지 않게
-            flow += [Spacer(1, 8), heading, gap]
+            flow += [PageBreak(), heading, gap]
             flow += content_flowables(lines, small, width, font)
         elif level == 2:
             body = content_flowables(lines, normal, width, font)
-            flow += [Spacer(1, 7), KeepTogether([_heading2(title, normal, width), Spacer(1, 3)] + body[:2])]
+            opener = ([CondPageBreak(USABLE_PAGE_HEIGHT * PAGE_BREAK_ROOM)] if any(k in title for k in PAGE_BREAK_BEFORE)
+                      else []) + [Spacer(1, _gap(SECTION_GAP))]
+            flow += opener + [KeepTogether([_heading2(title, normal, width), Spacer(1, _gap(HEADING_GAP))] + body[:2])]
             flow += body[2:]
         elif level == 3 and title.startswith(NOTE_TITLE):
             inner = [Paragraph(_inline(title), small["label"])] + content_flowables(lines, small, width - 24, font)
@@ -1366,7 +1441,7 @@ def _page_decorations(font: str, label: str, counter: dict):
 # ── PDF 저장 ─────────────────────────────────────────────────
 def export_report_pdf(report: str, output_dir: Path = OUTPUT_DIR, filename: str | None = None,
                       state: dict | None = None, report_date: str | None = None) -> tuple[Path, int]:
-    """보고서를 PDF로 저장하고 (저장 경로, 페이지 수)를 돌려준다. 5장을 넘으면 경고한다.
+    """보고서를 PDF로 저장하고 (저장 경로, 페이지 수)를 돌려준다. MIN_PAGES~MAX_PAGES를 벗어나면 경고한다.
 
     state를 함께 주면 1쪽에 '제목 밴드 → SUMMARY → 결정 대시보드' 순서로 그린다. (없으면 본문만)
     SUMMARY가 실제 조판 기준으로 반 페이지를 넘으면 경고한다.
@@ -1391,8 +1466,10 @@ def export_report_pdf(report: str, output_dir: Path = OUTPUT_DIR, filename: str 
                            if has_result else ([], []))
         until_summary, after_summary = _split_at_summary(parse_blocks(report))
         has_band = bool(header)
-        return (header + render_blocks(until_summary, font, bold, width, has_band)
-                + visuals + render_blocks(after_summary, font, bold, width, has_band))
+        rest = render_blocks(after_summary, font, bold, width, has_band)
+        if rest and not isinstance(rest[0], PageBreak):
+            rest = [PageBreak()] + rest   # 1쪽은 제목 밴드·SUMMARY·대시보드만
+        return header + render_blocks(until_summary, font, bold, width, has_band) + visuals + rest
 
     ratio = measure_summary_ratio(report)  # SUMMARY가 반 페이지를 넘는지 실제 높이로 확인
     if ratio > SUMMARY_MAX_PAGE_RATIO:
@@ -1411,18 +1488,41 @@ def export_report_pdf(report: str, output_dir: Path = OUTPUT_DIR, filename: str 
         doc.build(make_story(), onFirstPage=first, onLaterPages=later)
         return counter
 
-    global _PLAIN_FIGURES
-    try:
-        counter = build()
-    except LayoutError as e:
-        logger.warning("[PDF] 경쟁 구도 그림이 한 쪽을 넘어 일반 표로 다시 저장합니다: %s", str(e)[:120])
-        _PLAIN_FIGURES = True
+    global _PLAIN_FIGURES, _LAYOUT_SCALE
+
+    def build_once() -> dict:
+        global _PLAIN_FIGURES
         try:
-            counter = build()
-        finally:
-            _PLAIN_FIGURES = False
+            return build()
+        except LayoutError as e:
+            logger.warning("[PDF] 경쟁 구도 그림이 한 쪽을 넘어 일반 표로 다시 저장합니다: %s", str(e)[:120])
+            _PLAIN_FIGURES = True
+            try:
+                return build()
+            finally:
+                _PLAIN_FIGURES = False
+
+    # 최소 쪽수(MIN_PAGES)에 못 미치면 간격 배율을 키워 다시 조판한다. 최대 쪽수를 넘기 직전 배율에서 멈춘다
+    try:
+        counter, used = build_once(), LAYOUT_SCALES[0]
+        for scale in LAYOUT_SCALES[1:]:
+            if counter["n"] >= MIN_PAGES:
+                break
+            _LAYOUT_SCALE = scale
+            trial = build_once()
+            if trial["n"] > MAX_PAGES:
+                _LAYOUT_SCALE = used
+                counter = build_once()   # 넘친 배율 대신 직전 배율로 다시 저장
+                break
+            counter, used = trial, scale
+    finally:
+        _LAYOUT_SCALE = 1.0
+    if used != LAYOUT_SCALES[0]:
+        logger.info("[PDF] 최소 %d장을 맞추려고 간격 배율 %.2f로 조판", MIN_PAGES, used)
 
     pages = counter["n"]
+    if pages < MIN_PAGES:
+        logger.warning("[PDF] %d장으로 최소 %d장에 못 미칩니다 (간격 배율 최대 %.2f).", pages, MIN_PAGES, used)
     if pages > MAX_PAGES:
         logger.warning("[PDF] %d장으로 과제 기준(%d장 이내)을 넘었습니다. 본문을 줄이세요.", pages, MAX_PAGES)
     else:

@@ -9,6 +9,7 @@ LLM: config.MODEL_ANALYZE
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
+from agents.rework import previous, rework_of, union
 from agents.web import format_results, search_many, to_source
 from config import LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MODEL_ANALYZE
 
@@ -35,21 +36,54 @@ PROMPT = """너는 AI 반도체 투자 심사역이다. '{name}'의 창업자와
 {results}"""
 
 
+NO_INFO = "공개 정보 부족"
+
+
+def rework_queries(name: str, ceo: str, focus: list[str]) -> tuple[list[str], list[str]]:
+    """Supervisor 재작업용 (general 검색어, news 검색어). 첫 실행의 '창업자 CTO 경력'·'대표 인터뷰'와 다른 경로로 찾는다."""
+    general = [f"{name} 공동창업자 연구진 출신", f"{name} 특허 발명자"]
+    if ceo:
+        general.append(f"{ceo} 대표 학력 이력")
+    news = [f"{name} 창업 스토리 인물"] if "publisher_diversity" in focus else []
+    return general, news
+
+
+def _merge_previous(prev: dict, new: dict) -> dict:
+    """재작업 전에 확인한 인력·강점·우려는 유지하고 새로 찾은 것만 더한다."""
+    merged = dict(new)
+    merged["members"] = union(prev.get("members") or [], new.get("members") or [], key=lambda m: m["name"].replace(" ", ""))
+    merged["strengths"] = union(prev.get("strengths") or [], new.get("strengths") or [])
+    merged["concerns"] = union(prev.get("concerns") or [], new.get("concerns") or [])
+    merged["team_size"] = new.get("team_size") or prev.get("team_size", "")
+    if merged["members"]:   # 인력을 찾았으면 '공개 정보 부족'은 더 이상 맞지 않는다
+        merged["concerns"] = [c for c in merged["concerns"] if NO_INFO not in c]
+    return merged
+
+
 def team_node(state: dict) -> dict:
     c = state["company"]
     name, ceo = c["name"], c.get("ceo", "")
-    queries = [f"{name} 창업자 CTO 경력", f"{name} 대표 인터뷰"]
-    if ceo:
-        queries.insert(0, f"{name} {ceo} 대표 경력")
-    results = search_many(queries, max_results=5, topic="general")
+    rework = rework_of(state, "team")
+    if rework:
+        queries, news = rework_queries(name, ceo, rework.get("focus") or [])
+        results = search_many(queries, max_results=5, topic="general")
+        if news:
+            results += search_many(news, max_results=5, topic="news")
+    else:
+        queries = [f"{name} 창업자 CTO 경력", f"{name} 대표 인터뷰"]
+        if ceo:
+            queries.insert(0, f"{name} {ceo} 대표 경력")
+        results = search_many(queries, max_results=5, topic="general")
     results = [r for r in results if name in r["title"] + r["content"]]
+    prev = previous(state, "team_analysis") if rework else None
     if not results:  # 근거가 없으면 LLM을 부르지 않는다 (빈 입력에서도 경력이 채워져 나온 적이 있음)
-        return {"team_analysis": {"members": [], "team_size": "", "strengths": [], "concerns": ["공개 정보 부족"]},
-                "sources": []}
+        empty = {"members": [], "team_size": "", "strengths": [], "concerns": [NO_INFO]}
+        return {"team_analysis": _merge_previous(prev, empty) if prev else empty, "sources": []}
     llm = ChatOpenAI(model=MODEL_ANALYZE, temperature=0, seed=LLM_SEED, max_tokens=LLM_MAX_TOKENS).with_structured_output(TeamAnalysis).with_retry(stop_after_attempt=LLM_ATTEMPTS)
     a = llm.invoke(PROMPT.format(name=name, ceo=ceo or "확인되지 않음", results=format_results(results)))
     used = [results[i] for i in dict.fromkeys(a.evidence_ids) if 0 <= i < len(results)]
+    analysis = a.model_dump(exclude={"evidence_ids"})
     return {
-        "team_analysis": a.model_dump(exclude={"evidence_ids"}),
+        "team_analysis": _merge_previous(prev, analysis) if prev else analysis,
         "sources": [to_source(r, name, "team") for r in used],
     }

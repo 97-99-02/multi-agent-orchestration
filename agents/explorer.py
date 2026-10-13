@@ -4,7 +4,8 @@
 1) 첫 호출: config.SEARCH_QUERIES로 검색해 후보를 발굴하고 조건(상장 여부, 투자 단계, 국내, AI 반도체 설계)을
    1차 판정해 최대 config.MAX_CANDIDATES개를 candidates에 저장. 검색 결과에 실제로 나온 기업명만 인정
 2) 매 호출: candidates[current_index] 기업을 다시 검색해 최신 조건을 상세 확인하고 세부 분야 분류
-출력: candidates, current_index(+1), company, is_eligible, eligibility_reason, sources, rejected(미충족 시)
+   current_index는 supervisor가 정한 '지금 평가할 후보 순번'으로 읽기만 한다 (제어 키는 supervisor만 쓴다)
+출력: candidates, company, is_eligible, eligibility_reason, sources, rejected(미충족 시)
   - 이전 기업 분석 결과는 state.RESET_ON_NEXT 로 비운다
   - LLM은 검색 결과에서 사실을 뽑기만 하고, 조건 충족 여부는 is_eligible_round() 등 코드로 판정한다
 """
@@ -152,11 +153,11 @@ def explorer_node(state: dict) -> dict:
     candidates = state.get("candidates") or discover_candidates()
     idx = state.get("current_index", 0)
     if idx >= len(candidates):  # 발굴 결과가 비었을 때
-        return {**RESET_ON_NEXT, "candidates": candidates, "current_index": idx,
+        return {**RESET_ON_NEXT, "candidates": candidates,
                 "is_eligible": False, "eligibility_reason": "조건을 충족하는 후보를 찾지 못함"}
     name = candidates[idx]
     result = verify_company(name)
-    out = {**RESET_ON_NEXT, "candidates": candidates, "current_index": idx + 1, **result}
+    out = {**RESET_ON_NEXT, "candidates": candidates, **result}
     if not result["is_eligible"]:
         out["rejected"] = [{"company": name, "reason": result["eligibility_reason"], "total": None}]
     return out

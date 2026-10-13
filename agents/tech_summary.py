@@ -3,6 +3,7 @@
 기업별 칩·공정·개발 단계·성능·매출·계약은 공개 웹 자료에서 수집한다.
 Chroma tech 보고서는 업계 기준과 기술적 의미를 해석하는 데 사용한다.
 각 기업 사실과 업계 해석의 근거를 따로 검증한 뒤 State에 넣는다.
+검색어·버린 주장 등 진단 정보는 State에 넣지 않고 obs.log_diagnostics로 결정 로그에 남긴다.
 """
 
 from __future__ import annotations
@@ -15,6 +16,8 @@ from typing import Literal
 from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
+from agents.rework import previous, rework_of, union
+from obs import log_diagnostics
 from agents.web import search_many, source_date, to_source as web_to_source
 from config import LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MODEL_ANALYZE
 from rag.retriever import get_retriever, to_source as report_to_source
@@ -104,9 +107,9 @@ SEARCH_GROUPS = (
 )
 
 
-def _collect_web(queries: list[str]) -> list[dict]:
+def _collect_web(queries: list[str], topic: str = "general") -> list[dict]:
     # 검색 오류를 '공개 정보 없음'으로 바꾸지 않는다. 호출자가 실패 원인을 확인할 수 있다.
-    results = search_many(queries, max_results=4, topic="general")
+    results = search_many(queries, max_results=4, topic=topic)
     return [{"kind": "web", "source": r,
              "text": (r.get("raw_content") or r.get("content", ""))[:WEB_TEXT_LIMIT],
              "title": r.get("title", ""), "date": source_date(r)} for r in results]
@@ -129,6 +132,46 @@ def _queries(name: str, segment: str, missing: list[str], *, retry: bool = False
                 for fields, _ in SEARCH_GROUPS if set(fields).intersection(missing)]
     return [f"{name} {segment} {terms}" for fields, terms in SEARCH_GROUPS
             if set(fields).intersection(missing)]
+
+
+# Supervisor 재작업용 검색어. 첫 검색(SEARCH_GROUPS)과 노드 안 재검색(RETRY_TERMS)이 이미 한국어로 찾았으므로
+# 영문 자료(해외 매체·보도자료)를 찾는다. 검색어와 seed가 고정이라 같은 검색어로는 같은 결과만 나온다
+REWORK_TERMS = {
+    "core_chips": "AI chip product NPU accelerator",
+    "process": "foundry process node nm",
+    "development_stage": "tape-out engineering sample mass production",
+    "performance_metrics": "TOPS per watt benchmark performance",
+    "strengths": "technology advantage SDK",
+    "weaknesses": "limitations",
+    "public_revenue_contracts": "customer order supply contract revenue",
+}
+
+
+def _rework_queries(name: str, product: str, focus: list[str]) -> tuple[list[str], list[str]]:
+    """(general 검색어, news 검색어). 발행처가 한쪽에 몰렸으면 뉴스 검색으로 다른 매체를 찾는다."""
+    subject = f"{name} {product}".strip()
+    fields = [f for f in focus if f in REWORK_TERMS]
+    general = [f"{subject} {REWORK_TERMS[f]}" for f in fields]
+    news = [f"{name} 반도체 기술 개발 성과"] if "publisher_diversity" in focus else []
+    if not general and not news:   # 보완 대상이 지정되지 않은 재작업이면 빈 항목 전체를 영문으로
+        general = [f"{subject} {REWORK_TERMS['core_chips']} {REWORK_TERMS['development_stage']}"]
+    return general, news
+
+
+def _merge_previous(prev: dict, new: dict) -> dict:
+    """재작업 전에 확인한 사실은 유지하고 새로 찾은 사실만 더한다 (항목별 문장, 근거 목록)."""
+    merged = dict(new)
+    for field in FIELDS:
+        merged[field] = union(prev.get(field) or [], new.get(field) or [], key=_compact)
+    merged["evidence"] = union(prev.get("evidence") or [], new.get("evidence") or [],
+                               key=lambda e: (e.get("field"), _compact(e.get("text", ""))))
+    merged["info_insufficient"] = any(not merged[field] for field in FIELDS)
+    merged["missing_fields"] = [field for field in FIELDS if not merged[field]]
+    merged["field_status"] = {field: "supported" if merged[field] else "not_found" for field in FIELDS}
+    if not new.get("industry_context") and prev.get("industry_context"):
+        merged["industry_context"] = prev["industry_context"]
+        merged["industry_context_status"] = prev.get("industry_context_status", "")
+    return merged
 
 
 def _date_label(item: dict) -> str:
@@ -343,18 +386,25 @@ def tech_summary_node(state: dict) -> dict:
     company = state["company"]
     name = company["name"]
     segment = company.get("segment") or "AI 반도체"
-    queries = _queries(name, segment, list(FIELDS))
-    if company.get("product"):
-        # main의 주력 제품명 검색 보완을 웹 사실 수집 단계에도 유지한다.
-        queries.append(f"{name} {company['product']} 개발 샘플 양산")
-    items = _merge(_collect_web(queries))
+    rework = rework_of(state, "tech_summary")
+    if rework:
+        # Supervisor 재작업: 첫 실행과 다른 검색어로 빈 항목만 찾고, 노드 안 재검색은 하지 않는다
+        queries, news_queries = _rework_queries(name, company.get("product", ""), rework.get("focus") or [])
+        items = _merge(_collect_web(queries) + (_collect_web(news_queries, topic="news") if news_queries else []))
+        queries = queries + news_queries
+    else:
+        queries = _queries(name, segment, list(FIELDS))
+        if company.get("product"):
+            # main의 주력 제품명 검색 보완을 웹 사실 수집 단계에도 유지한다.
+            queries.append(f"{name} {company['product']} 개발 샘플 양산")
+        items = _merge(_collect_web(queries))
     selected, rewrite = _relevant(name, items)
     evidence = [item for item in selected if _has_company(item, name)][:MAX_COMPANY_EVIDENCE]
     rejected = []
     claims = _grounded(name, evidence, rejected)
     missing = [field for field in FIELDS if not any(c.field == field for c in claims)]
-    retry_queries = _queries(name, segment, missing, retry=True) if missing else []
-    if not claims and rewrite and rewrite not in queries + retry_queries:
+    retry_queries = _queries(name, segment, missing, retry=True) if missing and not rework else []
+    if not rework and not claims and rewrite and rewrite not in queries + retry_queries:
         retry_queries.append(rewrite)
     if retry_queries:
         more = _merge(_collect_web(retry_queries))
@@ -394,10 +444,15 @@ def tech_summary_node(state: dict) -> dict:
         "field_status": {field: "supported" if summary[field] else "not_found" for field in FIELDS},
         "industry_context": context,
         "industry_context_status": context_status,
-        "diagnostics": {"web_queries": queries, "retry_queries": retry_queries,
-                        "retrieved_web": len(items), "selected_web": len(evidence),
-                        "accepted_claims": len(claims), "rejected_claims": rejected,
-                        "rag": rag_diagnostics},
     })
+    # 검색어·버린 주장 목록 같은 진단은 State가 아니라 결정 로그에 남긴다 (체크포인트마다 저장되는 State 크기를 줄임)
+    log_diagnostics(state.get("trace_id"), "tech_summary", name, {
+        "web_queries": queries, "retry_queries": retry_queries,
+        "retrieved_web": len(items), "selected_web": len(evidence),
+        "accepted_claims": len(claims), "rejected_claims": rejected,
+        "rag": rag_diagnostics, "rework": rework})
+    prev = previous(state, "tech_summary") if rework else None
+    if prev:
+        summary = _merge_previous(prev, summary)
     sources = [source_by_id[i] for i in used_ids] + report_sources
     return {"tech_summary": summary, "sources": sources}

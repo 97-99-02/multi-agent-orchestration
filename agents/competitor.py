@@ -13,6 +13,7 @@ from langchain_openai import ChatOpenAI
 from pydantic import BaseModel, Field
 
 from agents.explorer import SEGMENT_RULES
+from agents.rework import previous, rework_of, union
 from agents.web import format_results, search_many, to_source
 from config import LLM_ATTEMPTS, LLM_MAX_TOKENS, LLM_SEED, MODEL_ANALYZE
 
@@ -78,6 +79,8 @@ PROMPT = """너는 AI 반도체 투자 심사역이다. '{name}'({segment}, 주�
 경쟁사는 같은 세부 분야({segment})에서 비슷한 칩을 만드는 기업으로 고른다. 다른 분야 기업과 비교하지 않는다.
 시장을 주도하는 대기업·상장사(진입 위협)와 비슷한 단계의 비상장 스타트업(상대적 위치)을 모두 찾아라.
 아래 검색 결과에 근거한 내용만 쓰고, 근거로 쓴 결과 번호를 evidence_ids에 넣어라.
+차별점과 비교 문장은 수치·사실(성능 수치, 공정, 특허, 고객)로 쓴다. 회사 보도자료의 홍보 표현('최적화된 성능',
+'혁신적인', '획기적인', '탁월한')은 옮기지 않는다. 수치 근거가 없는 차별점은 "수치 근거 없음"을 붙인다.
 
 {results}"""
 
@@ -116,16 +119,47 @@ def _norm(s: str) -> str:
     return s.split("(")[0].replace(" ", "").lower()
 
 
+NOT_FOUND = "같은 세부 분야 경쟁사를 공개 자료로 확인하지 못함"
+
+
+def rework_queries(name: str, product: str, segment: str, focus: list[str]) -> tuple[list[str], list[str]]:
+    """Supervisor 재작업용 (general 검색어, news 검색어). 첫 실행은 국내 기사 3개 + 분야 영문 1개로 찾았으므로
+    대상 제품 기준 영문 비교와 국내 업계 동향 기사로 찾는다."""
+    subject = product or name
+    general = [f"{subject} alternatives competitors comparison", f"{SEGMENT_KEYWORDS_EN.get(segment, 'AI chip companies')} startups funding"]
+    news = [f"{SEGMENT_KEYWORDS.get(segment, 'AI 반도체')} 국내외 업체 경쟁 구도"]
+    if "publisher_diversity" in focus:
+        news.append(f"{name} 경쟁 제품 비교 평가")
+    return general, news
+
+
+def _merge_previous(prev: dict, new: dict) -> dict:
+    """재작업 전에 확인한 경쟁사·차별점·리스크는 유지하고 새로 찾은 것만 더한다."""
+    merged = dict(new)
+    merged["competitors"] = union(prev.get("competitors") or [], new.get("competitors") or [], key=lambda x: _norm(x["name"]))
+    merged["differentiation"] = union(prev.get("differentiation") or [], new.get("differentiation") or [])
+    merged["competitive_risks"] = union(prev.get("competitive_risks") or [], new.get("competitive_risks") or [])
+    merged["excluded_other_segment"] = union(prev.get("excluded_other_segment") or [], new.get("excluded_other_segment") or [])
+    if merged["competitors"]:
+        merged["competitive_risks"] = [r for r in merged["competitive_risks"] if r != NOT_FOUND]
+    return merged
+
+
 def competitor_node(state: dict) -> dict:
     c = state["company"]
     name, segment, product = c["name"], c.get("segment", ""), c.get("product", "")
     kw = SEGMENT_KEYWORDS.get(segment, "AI 반도체")
-    results = search_many([
-        f"{name} 경쟁사 비교",
-        f"{kw} 시장 주요 업체",       # 선도 기업 (국내 기사)
-        f"{kw} 스타트업 투자 유치",   # 동급 기업
-    ], max_results=5)
-    results += search_many([SEGMENT_KEYWORDS_EN.get(segment, "AI chip companies")], max_results=5, topic="general")
+    rework = rework_of(state, "competitor")
+    if rework:
+        general, news = rework_queries(name, product, segment, rework.get("focus") or [])
+        results = search_many(news, max_results=5) + search_many(general, max_results=5, topic="general")
+    else:
+        results = search_many([
+            f"{name} 경쟁사 비교",
+            f"{kw} 시장 주요 업체",       # 선도 기업 (국내 기사)
+            f"{kw} 스타트업 투자 유치",   # 동급 기업
+        ], max_results=5)
+        results += search_many([SEGMENT_KEYWORDS_EN.get(segment, "AI chip companies")], max_results=5, topic="general")
     prompt = PROMPT.format(name=name, segment=segment, product=product, results=format_results(results))
     a = ChatOpenAI(model=MODEL_ANALYZE, temperature=0, seed=LLM_SEED, max_tokens=LLM_MAX_TOKENS).with_structured_output(CompetitorAnalysis).with_retry(stop_after_attempt=LLM_ATTEMPTS).invoke(prompt)
     evidence_ids = list(a.evidence_ids)
@@ -165,8 +199,11 @@ def competitor_node(state: dict) -> dict:
             analysis, more_ids = _rewrite_with_tier(prompt, analysis, bases)
             evidence_ids += more_ids
     if not analysis["competitors"]:
-        analysis["competitive_risks"].append("같은 세부 분야 경쟁사를 공개 자료로 확인하지 못함")
+        analysis["competitive_risks"].append(NOT_FOUND)
     used = [results[i] for i in dict.fromkeys(evidence_ids) if 0 <= i < len(results)]
+    prev = previous(state, "competitor_analysis") if rework else None
+    if prev:
+        analysis = _merge_previous(prev, analysis)
     return {
         "competitor_analysis": analysis,
         "sources": [to_source(r, name, "competitor") for r in used],

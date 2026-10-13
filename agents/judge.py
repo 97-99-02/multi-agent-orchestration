@@ -142,8 +142,8 @@ def cite(ids: list[int], sources: list[dict]) -> list[dict]:
 
 
 def is_placeholder(analysis: dict | None) -> bool:
-    """분석 결과가 비었거나 아직 구현되지 않은 임시 값({"todo": True})인가."""
-    return not analysis or bool(analysis.get("todo"))
+    """분석 결과가 비었거나, 임시 값({"todo": True})이거나, 실행 오류로 채워지지 않았는가({"failed": True})."""
+    return not analysis or bool(analysis.get("todo") or analysis.get("failed"))
 
 
 def apply_evidence_rules(card: Scorecard, state: dict, sources: list[dict]) -> dict:
@@ -155,7 +155,9 @@ def apply_evidence_rules(card: Scorecard, state: dict, sources: list[dict]) -> d
         "market": (state.get("market_analysis") or {}).get("info_insufficient", False)
                   or is_placeholder(state.get("market_analysis")),
         "tech": is_placeholder(state.get("tech_summary")),
-        "traction": is_placeholder(state.get("tech_summary")),   # 실적 근거는 기술 요약의 공개 매출·계약
+        # 실적 근거는 기술 요약의 공개 매출·계약. 이 항목이 비면 정부 과제·MOU만으로 3점 이상을 주지 않는다 (최대 2점)
+        "traction": is_placeholder(state.get("tech_summary"))
+                    or not (state.get("tech_summary") or {}).get("public_revenue_contracts", True),
         "team": is_placeholder(state.get("team_analysis")),
         "competition": is_placeholder(state.get("competitor_analysis")),
     }

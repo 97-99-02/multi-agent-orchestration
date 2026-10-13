@@ -49,3 +49,21 @@ CORE_CAUTION_SCORE = 2           # 핵심 항목이 이 점수 이하이면 보�
 
 # 4.1 사실 검증 재작성 횟수
 MAX_REPORT_RETRY = 1
+
+# Supervisor 종료 보장 (반복 상한)
+MAX_REWORK = 1          # 관점당 재작업 횟수 (기업 단위). 공개 정보가 없으면 다시 찾아도 없다
+MAX_QUALITY_LOOPS = 2   # 품질 평가 미달로 보고서를 다시 쓰는 횟수
+# 보고서 품질 평가 기준 (agents/quality.py 코드 검사)
+QUALITY_CITED_RATIO = 0.8        # Groundedness: 분석 장에서 숫자가 든 문단 중 [n] 인용이 있는 비율
+QUALITY_MAX_UNVERIFIED = 2       # Groundedness: 사실 검증이 남긴 '(확인 필요)' 표시 허용 개수
+QUALITY_MIN_PUBLISHERS = 3       # 편향 통제: 인용된 출처의 발행처 수
+QUALITY_MAX_SOURCE_SHARE = 0.4   # 편향 통제: 출처 하나가 전체 인용에서 차지하는 비율 상한
+QUALITY_MAX_SAME_DAY_SHARE = 0.5 # 편향 통제: 인용한 웹 기사 중 같은 날 보도 비율 상한 (같은 발표의 재전송)
+
+# supervisor 실행 횟수 상한. 후보 1곳에 약 5회(탐색, 분석, 재작업, 판단 뒤마다 1회) × 최대 5곳 = 25,
+# 보고서 이후 약 12회(작성·사실 검증·재작성·품질 평가 루프) = 37 → 여유를 두어 40
+MAX_STEPS = 40
+# LangGraph 단계 상한(마지막 안전장치). supervisor와 하위 노드가 번갈아 실행되므로 supervisor 1회당 2단계
+# + 여유. 실제 종료는 MAX_STEPS 등 위 상한이 담당하고, 이 값에 걸리면 설계 오류다
+RECURSION_LIMIT = 2 * MAX_STEPS + 10
+MAX_RESUME = 1          # 실행 중 예외로 멈췄을 때 마지막 체크포인트에서 이어가는 횟수
