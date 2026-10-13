@@ -183,6 +183,24 @@ def test_competitor_rework_queries_differ_from_first_run():
     assert len(competitor.rework_queries("A사", "X1", "엣지", ["publisher_diversity"])[1]) == 2
 
 
+def test_competitor_rework_looks_for_numbers_when_no_comparison():
+    general, news = competitor.rework_queries("A사", "X1", "엣지", ["comparison_evidence"])
+    assert any("benchmark" in q for q in general) and any("전력 효율" in q for q in news)
+
+
+def test_competitor_merge_combines_claims_of_same_competitor():
+    # 첫 실행에서 비교 근거가 없던 경쟁사도 재작업에서 찾은 주장이 붙어야 한다 (경쟁사 단위로 합치면 버려졌다)
+    prev = {"competitors": [{"name": "Hailo", "summary": "엣지 NPU", "claims": [], "comparison": competitor.NO_COMPARISON}],
+            "differentiation": [], "competitive_risks": []}
+    new = {"competitors": [{"name": "Hailo-8", "claims": [{"text": "26 TOPS", "speaker": "경쟁사", "basis": "수치"}]},
+                           {"name": "Hailo", "summary": "", "claims": [{"text": "26 TOPS", "speaker": "경쟁사", "basis": "수치"}]}],
+           "differentiation": [], "competitive_risks": []}
+    merged = competitor._merge_previous(prev, new, "A사")
+    hailo = next(c for c in merged["competitors"] if c["name"] == "Hailo")
+    assert hailo["claims"] == [{"text": "26 TOPS", "speaker": "경쟁사", "basis": "수치"}]
+    assert hailo["comparison"] == "26 TOPS (Hailo 발표)" and hailo["summary"] == "엣지 NPU"
+
+
 def test_competitor_merge_keeps_previous_and_drops_not_found_risk():
     prev = {"competitors": [], "differentiation": ["SDK"], "competitive_risks": [competitor.NOT_FOUND]}
     new = {"competitors": [{"name": "딥엑스 (DEEPX)"}], "differentiation": [], "competitive_risks": ["가격 경쟁"]}

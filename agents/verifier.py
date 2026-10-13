@@ -119,7 +119,8 @@ NOTE_HEADING = "### 자동 검증 결과"    # 한계점 뒤에 붙는 검증 �
 MARKABLE_KINDS = ("number", "spelled", "overclaim", "citation", "rag_number")  # 본문에 표시할 불일치 종류
 
 # 수량 단위: 배수(억·조…)와 단위(원·달러·%…)
-MAGNITUDES = {"조": 1e12, "억": 1e8, "만": 1e4, "천": 1e3}
+# 백만·천만: 원문이 '3,400백만달러'처럼 쓰면 34억 달러다. 없으면 3400으로 읽어 '3.4억 달러' 같은 환산 오류를 못 잡았다
+MAGNITUDES = {"조": 1e12, "억": 1e8, "천만": 1e7, "백만": 1e6, "만": 1e4, "천": 1e3}
 UNITS = ("달러", "원", "%", "배", "명", "개", "건", "년", "개월", "점", "nm", "TOPS", "W")
 YEAR_UNIT, SCORE_UNIT = "년", "점"
 # 10 미만이어도 검사할 단위: 비율·배수·점수·금액·성능. 개수 단위(개·건·명·개월)는 '6개 항목', '3건' 같은
@@ -160,7 +161,7 @@ EVIDENCE_KEYS = (
 
 # 수량 규칙: 숫자 + (배수) + (단위).  예) '1,200억 원', '25%', '4점', '300억 달러', '15년'
 QUANTITY_PATTERN = re.compile(
-    r"(?<![\d.])(\d[\d,]*(?:\.\d+)?)\s*(" + "|".join(MAGNITUDES) + r")?\s*("
+    r"(?<![\d.])(\d[\d,]*(?:\.\d+)?)\s*(" + "|".join(sorted(MAGNITUDES, key=len, reverse=True)) + r")?\s*("
     + "|".join(sorted(UNITS, key=len, reverse=True)) + r")?"
 )
 # 금액을 한글 숫자로 쓴 경우: '천억 원', '삼백억 달러'

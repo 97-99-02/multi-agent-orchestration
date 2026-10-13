@@ -7,6 +7,8 @@
 """
 from types import SimpleNamespace
 
+import pytest
+
 from agents import quality, reporter, verifier
 from config import MAX_QUALITY_LOOPS
 
@@ -149,6 +151,26 @@ def test_short_report_is_typeset_with_larger_spacing(tmp_path, monkeypatch):
     assert reporter._LAYOUT_SCALE == 1.0          # 조판이 끝나면 배율을 되돌린다
 
 
+@pytest.mark.parametrize("trials, chosen", [
+    # 최소 쪽수를 채운 배율 중 마지막 쪽이 30% 이상 찬 가장 작은 배율 (x1.3은 7쪽이지만 마지막 쪽 2%)
+    ([(1.0, 6, 0.2), (1.2, 6, 0.83), (1.3, 7, 0.02), (1.6, 7, 0.44)], 1.6),
+    ([(1.0, 7, 0.05), (1.1, 8, 0.5)], 1.1),                 # 7쪽이어도 마지막 쪽이 거의 비면 배율을 더 키운다
+    ([(1.0, 5, 1.0), (1.5, 6, 0.97), (1.6, 7, 0.11)], 1.6),  # 최소 쪽수를 채우는 배율이 하나뿐이면 그것
+    ([(1.0, 5, 0.9), (1.1, 6, 0.2), (1.2, 6, 0.8)], 1.2),    # 최소 쪽수에 못 미치면 쪽수 많고 마지막 쪽이 찬 것
+    ([(1.0, 11, 0.5)], 1.0),
+])
+def test_layout_scale_avoids_nearly_empty_last_page(trials, chosen):
+    assert reporter.choose_layout_scale(trials) == chosen
+
+
+def test_end_marker_measures_room_left_on_last_page(tmp_path):
+    from reportlab.platypus import SimpleDocTemplate, Spacer
+    sink = {}
+    doc = SimpleDocTemplate(str(tmp_path / "m.pdf"), pagesize=reporter.A4, topMargin=50, bottomMargin=50)
+    doc.build([Spacer(1, 300), reporter._EndMarker(sink)])
+    assert abs(sink["left"] - (reporter.A4[1] - 100 - 12 - 300)) < 1     # 프레임 높이 - 위아래 여백 6pt씩 - 300
+
+
 def test_body_starts_on_new_page_only_when_first_page_is_full(tmp_path):
     ref = "## REFERENCE\n### 웹페이지\n- [1] 매체(2026). 기사.\n"
     body = "## 1. 사업 아이디어·기술 성숙도\n짧은 본문[1].\n"
@@ -180,6 +202,40 @@ def test_competitor_table_has_no_bare_source_line_and_sources_show_their_agent()
     full = {**state, "company": {"name": "A사"}, "scores": {"decision": "투자"}, "candidates": ["A사"],
             **{k: {} for k in ("tech_summary", "market_analysis", "team_analysis")}}
     assert reporter.build_materials(full, sources)["sources_for_citation"][0]["used_by"] == ["competitor", "team"]
+
+
+CHECKED = {"competitor_analysis": {
+    "competitors": [{"name": "Qualcomm", "tier": "선도 기업", "country": "미국", "product": "Snapdragon", "summary": "모바일 AP·NPU",
+                     "claims": [], "comparison": "비교 근거 없음"},
+                    {"name": "NVIDIA", "tier": "선도 기업", "country": "미국", "product": "Jetson Orin", "summary": "엣지 AI 모듈",
+                     "claims": [{"text": "젯슨 오린 275 TOPS", "speaker": "경쟁사", "basis": "수치", "url": "https://b.com/2"}]}],
+    "differentiation": [{"text": "NPU용 SDK 제공", "speaker": "대상 기업", "basis": "사실", "kind": "소프트웨어 개발 환경",
+                         "url": "https://a.com/1"}],
+    "competitive_risks": ["퀄컴의 시장 진입"], "not_comparable": ["TOPS/W: 측정 조건이 다름"]},
+    "company": {"name": "모빌린트", "product": "ARIES"}}
+CHECKED_SOURCES = [{"n": 4, "raw": [{"url": "https://a.com/1"}]}, {"n": 7, "raw": [{"url": "https://b.com/2"}]}]
+
+
+def test_competitor_table_shows_who_announced_and_cites_each_claim():
+    table = reporter.build_competitor_table(CHECKED, CHECKED_SOURCES)
+    assert "| 엣지 AI 모듈 | 젯슨 오린 275 TOPS (NVIDIA 발표) [7] |" in table
+    assert "| 모바일 AP·NPU | 비교 근거 없음 |" in table
+    assert "NPU용 SDK 제공 (모빌린트 발표) [4]" in table
+    assert "직접 비교할 수 없는 항목: TOPS/W: 측정 조건이 다름" in table
+
+
+def test_pdf_puts_comparison_evidence_under_the_figure_not_in_cards():
+    block = reporter.build_competitor_table(CHECKED, CHECKED_SOURCES).split("\n\n")[0].splitlines()   # 구도 표만
+    rows = reporter.comparison_rows(block)
+    assert rows[0].startswith(f"| {reporter.COMPARISON_HEADER} |") and "| NVIDIA | 젯슨 오린 275 TOPS (NVIDIA 발표) [7] |" in rows
+    old = ["| 구분 | 기업 | 국가 | 제품 | 비교 |", "|---|---|---|---|---|", "| 선도 기업 | Qualcomm | 미국 | X | 점유율 15% |"]
+    assert reporter.comparison_rows(old) == []          # 예전 보고서는 카드에 비교 문장이 있다
+
+
+def test_previous_body_drops_not_comparable_line():
+    body = reporter.insert_competitor_table("## 5. 경쟁 구도\n{{COMPETITOR_TABLE}}\n해설.\n", CHECKED, CHECKED_SOURCES)
+    prev = reporter.previous_body({"report": body + "\n## REFERENCE\n"}, [])
+    assert reporter.NOT_COMPARABLE_PREFIX not in prev and "해설." in prev
 
 
 def test_key_name_citations_are_removed():
@@ -224,6 +280,44 @@ def test_field_names_are_translated_but_english_words_kept():
 def test_prompt_rules_for_consistency_and_summary_citations():
     assert "모든 장에서 같은 값·시점" in reporter.SYSTEM_PROMPT
     assert "줄마다 끝에 출처 번호" in reporter.SYSTEM_PROMPT
+
+
+def test_summary_caution_says_what_to_check():
+    # '기술·제품 성숙도 2점 확인 필요'처럼 점수만 되풀이하지 않고 다음 점수 조건을 확인할 일로 쓴다
+    scores = {"cautions": [{"item": "tech", "label": "기술·제품 성숙도", "score": 2, "insufficient": False,
+                            "comment": "기술·제품 성숙도 2점"}]}
+    hint = reporter.caution_summary_hint(scores)
+    assert hint == f"기술·제품 성숙도 2점(낮은 평가): 3점 조건인 '{LEVELS['tech'][2]}' 충족 여부 확인 필요"
+
+
+COMPETITION_OK = ("## 5. 경쟁 구도\n**확인된 사실**\n- 사실[1]\n**비교 결과**\n같은 조건의 비교 자료가 없어 우열을 판단할 수 없다.\n"
+                  "**투자 관점 해석**\n경쟁 우위 2점.\n")
+
+
+def test_format_check_requires_three_parts_in_competition_chapter():
+    head = "## SUMMARY\n요약.\n"
+    tail = "## REFERENCE\n- [1] 출처\n"
+    missing = reporter.check_format(head + "## 5. 경쟁 구도\n해설.\n" + tail, structured_summary=True)
+    assert any("확인된 사실, 비교 결과, 투자 관점 해석" in v for v in missing)
+    ok = reporter.check_format(head + COMPETITION_OK + tail, structured_summary=True)
+    assert not any("경쟁 구도" in v for v in ok)
+
+
+def test_prompt_rules_for_tense_competition_parts_and_acronyms():
+    assert "MOU·협약 체결을 실증 완료로 쓰지 않습니다" in reporter.SYSTEM_PROMPT
+    assert "'**확인된 사실**', '**비교 결과**', '**투자 관점 해석**'" in reporter.SYSTEM_PROMPT
+    assert "comparable=true인 수치만 우열을 씁니다" in reporter.SYSTEM_PROMPT
+    assert "풀어 쓴 표기가 있을 때만 풀어 쓰고" in reporter.SYSTEM_PROMPT
+
+
+def test_prompt_rules_for_summary_risk_citations():
+    assert "정확히 3개, 줄마다 끝에 그 리스크를 다룬 출처 번호" in reporter.SYSTEM_PROMPT
+    assert "리스크를 다루지 않는 출처 번호를 붙이지 않습니다" in reporter.SYSTEM_PROMPT
+
+
+def test_prompt_rules_for_units_years_and_forecasts():
+    assert "다른 단위로 바꾼 값을 괄호로 덧붙이지 않습니다" in reporter.SYSTEM_PROMPT
+    assert "'연도 미상'" in reporter.SYSTEM_PROMPT and "forecast=true" in reporter.SYSTEM_PROMPT
 
 
 # ---------- 지적된 장만 재작성 (2차 피드백 C단계) ----------
@@ -317,11 +411,11 @@ def test_reporter_node_rewrites_only_flagged_chapter():
     assert "원래 개요." in report and "원래 한계." in report and "고친 리스크." in report
 
 
-def test_landscape_card_text_is_shortened_to_first_sentence():
+def test_landscape_card_text_is_first_sentence_or_nothing():
     long = ("Snapdragon processors with integrated NPUs for edge AI. Qualcomm has a 15.6% share of the market "
             "and keeps expanding into automotive and PC segments with new chips.")
     assert reporter._short(long, 110) == "Snapdragon processors with integrated NPUs for edge AI."
-    assert reporter._short("가" * 50 + " " + "나" * 80, 110).endswith("…")
+    assert reporter._short("가" * 50 + " " + "나" * 80, 110) == ""            # 중간에 잘라 '…'을 붙이지 않는다
     assert reporter._short("짧은 설명", 110) == "짧은 설명"
 
 

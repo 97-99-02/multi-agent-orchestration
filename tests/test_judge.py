@@ -329,3 +329,69 @@ def test_market_score_capped_by_rubric():
 
 def test_judge_prompt_excludes_sub_market_figures():
     assert "sub_market=true(PC·스마트폰 등 하위 시장) 수치는 3~5점 근거로 쓰지 않는다" in judge.PROMPT
+
+
+# ---------- 경쟁 우위: 원문으로 확인된 주장으로 기준표 조건 확인 ----------
+def strength(kind, basis="사실", speaker="대상 기업", comparable=False):
+    return {"text": kind, "kind": kind, "basis": basis, "speaker": speaker, "comparable": comparable}
+
+
+COMPARED = [{"name": "C사", "claims": [{"text": "C사 26 TOPS", "basis": "수치", "speaker": "경쟁사", "comparable": False}]}]
+
+
+def test_competition_cap_follows_rubric_conditions():
+    assert judge.competition_cap({"w": 1}) == (None, "", False)                       # 예전 형식은 적용하지 않는다
+    # 회사 발표 수치라도 측정 조건이 다르면 수치 우위가 아니다 ('동급 GPU 대비 2배')
+    self_claim = strength("성능 수치", basis="수치", comparable=False)
+    assert judge.competition_cap({"competitors": COMPARED, "differentiation": [self_claim]})[:2] == (2, "같은 조건의 수치 우위 근거 없음")
+    same = strength("성능 수치", basis="수치", comparable=True)
+    assert judge.competition_cap({"competitors": COMPARED, "differentiation": [same]})[0] == 3
+    sdk = strength("소프트웨어 개발 환경")
+    assert judge.competition_cap({"competitors": COMPARED, "differentiation": [same, sdk]})[0] == 4
+    mlperf = strength("제3자 검증", speaker="제3자")
+    assert judge.competition_cap({"competitors": COMPARED, "differentiation": [same, sdk, mlperf]})[0] is None
+    assert judge.competition_cap({"competitors": [{"name": "C사", "claims": []}], "differentiation": [sdk]})[2]   # 비교 근거 없음
+
+
+def test_competition_without_checked_comparison_is_insufficient():
+    state = {**STATE, "competitor_analysis": {"competitors": [{"name": "C사", "claims": []}], "differentiation": []}}
+    items, _, _ = evaluate(card(competition=item(3)), state)
+    assert items["competition"]["score"] == 2 and items["competition"]["insufficient"]
+    state = {**STATE, "competitor_analysis": {"competitors": COMPARED, "differentiation": [strength("성능 수치", basis="수치")]}}
+    items, _, _ = evaluate(card(competition=item(5)), state)
+    assert items["competition"]["score"] == 2 and "같은 조건의 수치 우위 근거 없음 → 최대 2점" in items["competition"]["evidence"]
+
+
+# ---------- 투자조건: 전략적 투자자가 없으면 최대 4점 ----------
+@pytest.mark.parametrize("name, strategic", [
+    ("삼성벤처투자", True), ("LG테크놀로지벤처스", True), ("포스코기술투자", True), ("KT인베스트먼트", True),
+    ("SK증권", False), ("교보생명", False), ("산업은행", False), ("미래에셋캐피탈", False), ("KTB네트워크", False),
+    ("에이티넘인베스트먼트", False),
+])
+def test_strategic_investor(name, strategic):
+    assert judge.is_strategic(name) is strategic
+
+
+def test_deal_capped_when_only_financial_investors():
+    # 5회차 엑시나: 투자사가 모두 재무적 투자자인데 '전략적 투자자(산업은행, 교보생명)'로 5점을 줬다
+    exina = {**STATE, "company": {"name": "A", "investors": ["에이티넘인베스트먼트", "산업은행", "교보생명"]}}
+    items, _, _ = evaluate(card(deal=item(5)), exina)
+    assert items["deal"]["score"] == 4 and "모두 재무적 투자자 → 최대 4점" in items["deal"]["evidence"]
+    with_si = {**STATE, "company": {"name": "A", "investors": ["포스코기술투자", "프랙시스캐피탈파트너스"]}}
+    assert evaluate(card(deal=item(5)), with_si)[0]["deal"]["score"] == 5
+
+
+def test_judge_prompt_rules_for_claims_and_strategic_investors():
+    assert "comparable=false인 수치는 우위 근거가 아니고" in judge.PROMPT
+    assert "은행·보험·증권·캐피탈·VC·정책금융기관은" in judge.PROMPT
+
+
+def test_risks_without_sources_are_dropped():
+    # 출처 없는 일반론 리스크('자금 소진 속도')에 보고서가 관계없는 출처를 붙였었다
+    c = card()
+    c.risks = [judge.Risk(category="시장", description="경쟁 심화", source_ids=[0]),
+               judge.Risk(category="운영", description="자금 소진 속도가 빠를 수 있음")]
+    risks = judge.score_card(c, STATE, judge.company_sources(STATE))["risks"]
+    assert risks == [{"category": "시장", "description": "경쟁 심화", "sources": [{"title": "기사", "url": "http://x"}]}]
+    assert "source_ids에 넣는다" in judge.PROMPT
+
